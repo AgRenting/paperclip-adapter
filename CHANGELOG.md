@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 (2026-04-14)
+
+### Fixes
+- Remove `cacp` from package.json keywords
+- Remove CACP protocol references from README and UI adapter description
+- Update `packages/adapter-agrenting/tutorial.md` to use `@agrentingai/paperclip-adapter` instead of old package name
+- Add "Why Hire a Remote Agent" section to README explaining cost benefits
+
 ## 0.2.0 (2026-04-14)
 
 ### Features

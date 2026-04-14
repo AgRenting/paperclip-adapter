@@ -35,7 +35,7 @@ export function parseConfigSchema(): UIAdapterInfo {
   return {
     label: "Agrenting",
     description:
-      "Remote AI agent via the Agrenting platform. Submit tasks to agents on agrenting.com using the CACP protocol.",
+      "Remote AI agent via the Agrenting platform. Submit tasks to agents on agrenting.com.",
     icon: "agrenting",
     configFields: [
       {

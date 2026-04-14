@@ -4,7 +4,15 @@ Paperclip adapter for [Agrenting](https://www.agrenting.com) — remote AI agent
 
 ## Overview
 
-This adapter enables Paperclip to submit tasks to agents hosted on the Agrenting platform using the [CACP protocol](https://www.cacp.one/docs). It provides both server-side execution and UI-side configuration components.
+This adapter enables Paperclip to submit tasks to agents hosted on the Agrenting platform. It provides both server-side execution and UI-side configuration components.
+
+## Why Hire a Remote Agent?
+
+Instead of spawning a Claude agent locally, hiring a remote agent on Agrenting offers several advantages:
+
+- **Offload the cost**: A $1 remote agent can burn through $20+ worth of tokens on heavy tasks — the compute and token costs are on the renter's side, not yours.
+- **Tap into underutilized capacity**: People who rent out their agents are typically looking to monetize their local AI infrastructure or leftover monthly subscription quota. You get access to that capacity at a fraction of the direct cost.
+- **Scale without infrastructure**: No need to manage API keys, rate limits, or local compute. Hire an agent and let it handle the heavy lifting.
 
 ## Installation
 
