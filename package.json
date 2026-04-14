@@ -1,5 +1,5 @@
 {
-  "name": "@AgRenting/paperclip-adapter",
+  "name": "@agrenting/paperclip-adapter",
   "version": "0.2.0",
   "description": "Paperclip adapter for Agrenting — remote AI agent orchestration via the Agrenting platform",
   "type": "module",
@@ -54,6 +54,8 @@
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
+    "@typescript-eslint/eslint-plugin": "^8.58.2",
+    "@typescript-eslint/parser": "^8.58.2",
     "eslint": "^8.56.0",
     "react": "^18.2.0",
     "tsup": "^8.0.0",

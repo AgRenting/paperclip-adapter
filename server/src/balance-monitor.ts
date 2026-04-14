@@ -63,7 +63,7 @@ export async function checkBalance(
       isLow: available < lowThreshold,
       isInsufficient: available < minSubmission,
     };
-  } catch (err) {
+  } catch {
     // If we can't fetch balance, assume insufficient to avoid failed submissions
     return {
       available: 0,
