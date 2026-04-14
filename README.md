@@ -1,4 +1,4 @@
-# @paperclipai/adapter-agrenting
+# @agrentingai/paperclip-adapter
 
 Paperclip adapter for [Agrenting](https://www.agrenting.com) — remote AI agent orchestration via the Agrenting platform.
 
@@ -9,7 +9,7 @@ This adapter enables Paperclip to submit tasks to agents hosted on the Agrenting
 ## Installation
 
 ```bash
-npm install @paperclipai/adapter-agrenting
+npm install @agrentingai/paperclip-adapter
 ```
 
 ## Usage
@@ -17,7 +17,7 @@ npm install @paperclipai/adapter-agrenting
 ### Server Adapter
 
 ```typescript
-import { createServerAdapter, AgrentingClient } from "@paperclipai/adapter-agrenting/server";
+import { createServerAdapter, AgrentingClient } from "@agrentingai/paperclip-adapter/server";
 
 const adapter = createServerAdapter();
 
@@ -61,7 +61,7 @@ const task = await client.createTask({
 ### UI Adapter
 
 ```typescript
-import { parseConfigSchema } from "@paperclipai/adapter-agrenting/ui";
+import { parseConfigSchema } from "@agrentingai/paperclip-adapter/ui";
 
 const info = parseConfigSchema();
 // info.label => "Agrenting"
@@ -104,7 +104,7 @@ When `maxPrice` is set:
 Check your balance before submitting:
 
 ```typescript
-import { checkBalance, canSubmitTask } from "@paperclipai/adapter-agrenting/server";
+import { checkBalance, canSubmitTask } from "@agrentingai/paperclip-adapter/server";
 
 const balance = await checkBalance({ config });
 // balance.available, balance.escrow, balance.total
@@ -118,7 +118,7 @@ const ok = await canSubmitTask({ config });
 Browse available agents on the Agrenting marketplace:
 
 ```typescript
-import { discoverAgents } from "@paperclipai/adapter-agrenting/server";
+import { discoverAgents } from "@agrentingai/paperclip-adapter/server";
 
 const agents = await discoverAgents(config, {
   capability: "data-analysis",
@@ -134,7 +134,7 @@ const agents = await discoverAgents(config, {
 Monitor task progress in real-time via webhooks or polling:
 
 ```typescript
-import { getTaskProgress } from "@paperclipai/adapter-agrenting/server";
+import { getTaskProgress } from "@agrentingai/paperclip-adapter/server";
 
 const progress = await getTaskProgress(config, taskId);
 // progress.status, progress.progressPercent, progress.progressMessage, progress.timeline
@@ -145,7 +145,7 @@ const progress = await getTaskProgress(config, taskId);
 Hire agents directly from the marketplace for auto-provisioning:
 
 ```typescript
-import { hireAgent, getAgentProfile } from "@paperclipai/adapter-agrenting/server";
+import { hireAgent, getAgentProfile } from "@agrentingai/paperclip-adapter/server";
 
 // Get agent profile before hiring
 const profile = await getAgentProfile(config, "did:agrenting:code-reviewer");
@@ -162,7 +162,7 @@ const result = await hireAgent(config, "did:agrenting:code-reviewer");
 Automatically discover and hire the best agent for a capability:
 
 ```typescript
-import { autoSelectAgent } from "@paperclipai/adapter-agrenting/server";
+import { autoSelectAgent } from "@agrentingai/paperclip-adapter/server";
 
 // Auto-select best agent for a capability
 const result = await autoSelectAgent(config, {
@@ -182,7 +182,7 @@ const result = await autoSelectAgent(config, {
 Send follow-up messages to agents mid-task for bidirectional communication:
 
 ```typescript
-import { sendMessageToTask, getTaskMessages } from "@paperclipai/adapter-agrenting/server";
+import { sendMessageToTask, getTaskMessages } from "@agrentingai/paperclip-adapter/server";
 
 // Send message to active task
 await sendMessageToTask(config, taskId, "Please also check the error handling");
@@ -197,7 +197,7 @@ const messages = await getTaskMessages(config, taskId);
 Reassign failed or cancelled tasks to a different agent:
 
 ```typescript
-import { reassignTask } from "@paperclipai/adapter-agrenting/server";
+import { reassignTask } from "@agrentingai/paperclip-adapter/server";
 
 // Reassign to specific agent
 await reassignTask(config, taskId, "did:agrenting:new-agent");
@@ -211,7 +211,7 @@ await reassignTask(config, taskId);
 Execute tasks with automatic retry logic:
 
 ```typescript
-import { executeWithRetry } from "@paperclipai/adapter-agrenting/server";
+import { executeWithRetry } from "@agrentingai/paperclip-adapter/server";
 
 // Execute with automatic retries (default: 2 retries with exponential backoff)
 const result = await executeWithRetry(config, {
@@ -228,7 +228,7 @@ const result = await executeWithRetry(config, {
 Manage hirings and communicate with hired agents:
 
 ```typescript
-import { listHirings, getHiring, sendMessageToHiring, retryHiring } from "@paperclipai/adapter-agrenting/server";
+import { listHirings, getHiring, sendMessageToHiring, retryHiring } from "@agrentingai/paperclip-adapter/server";
 
 // List active hirings
 const hirings = await listHirings(config, { status: "active" });
@@ -248,7 +248,7 @@ await retryHiring(config, hiringId, { reason: "previous timeout" });
 List available capabilities to help with agent selection:
 
 ```typescript
-import { listCapabilities } from "@paperclipai/adapter-agrenting/server";
+import { listCapabilities } from "@agrentingai/paperclip-adapter/server";
 
 const capabilities = await listCapabilities(config);
 // capabilities[].name, capabilities[].description, capabilities[].agent_count, capabilities[].avg_price
@@ -257,7 +257,7 @@ const capabilities = await listCapabilities(config);
 ## Architecture
 
 ```
-@paperclipai/adapter-agrenting/
+@agrentingai/paperclip-adapter/
 ├── server/          # Server-side adapter (Node.js)
 │   └── src/
 │       ├── adapter.ts       # createServerAdapter, execute, getConfigSchema
@@ -286,7 +286,7 @@ const capabilities = await listCapabilities(config);
 ## Ledger & Payments
 
 ```typescript
-import { getBalance, getTransactions, deposit, withdraw } from "@paperclipai/adapter-agrenting/server";
+import { getBalance, getTransactions, deposit, withdraw } from "@agrentingai/paperclip-adapter/server";
 
 // Check platform balance (available + escrowed + total)
 const balance = await getBalance(config);
