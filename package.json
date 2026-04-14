@@ -1,6 +1,6 @@
 {
   "name": "@agrentingai/paperclip-adapter",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Paperclip adapter for Agrenting — remote AI agent orchestration via the Agrenting platform",
   "type": "module",
   "exports": {
@@ -32,8 +32,7 @@
     "paperclip",
     "agrenting",
     "adapter",
-    "ai-agents",
-    "cacp"
+    "ai-agents"
   ],
   "author": "AgRenting",
   "license": "MIT",
