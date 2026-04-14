@@ -1,5 +1,5 @@
 {
-  "name": "@agrenting/paperclip-adapter",
+  "name": "@agrentingai/paperclip-adapter",
   "version": "0.2.0",
   "description": "Paperclip adapter for Agrenting — remote AI agent orchestration via the Agrenting platform",
   "type": "module",
@@ -39,7 +39,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/AgRenting/paperclip-adapter"
+    "url": "git+https://github.com/AgRenting/paperclip-adapter.git"
   },
   "engines": {
     "node": ">=20.0.0"
