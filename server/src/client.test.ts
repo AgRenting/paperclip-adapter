@@ -666,7 +666,7 @@ describe("AgrentingClient", () => {
 
       await client.hireAgent("did:agrenting:x", { pricingModel: "per-token" });
 
-      const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
       const body = JSON.parse(call[1].body);
       expect(body.pricing_model).toBe("per-token");
     });
@@ -730,7 +730,7 @@ describe("AgrentingClient", () => {
 
       await client.sendMessageToTask("task-42", { message: "Good job!", messageType: "feedback" });
 
-      const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
       const body = JSON.parse(call[1].body);
       expect(body.message_type).toBe("feedback");
     });
@@ -774,7 +774,7 @@ describe("AgrentingClient", () => {
 
       expect(result.new_agent_did).toBe("did:agrenting:auto-picked");
       // Verify empty body was sent
-      const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+      const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
       const body = JSON.parse(call[1].body);
       expect(body.new_agent_did).toBeUndefined();
     });

@@ -203,8 +203,10 @@ export interface TaskMessage {
 /** Result of reassigning a task to a different agent */
 export interface ReassignTaskResult {
   task_id: string;
-  new_provider_agent_id: string;
-  status: string;
+  previous_agent_did: string;
+  new_agent_did: string;
+  new_provider_agent_id?: string;
+  status?: string;
   reassigned_at?: string;
 }
 

@@ -4,7 +4,6 @@ import {
   registerTaskMapping,
   unregisterTaskMapping,
   getActiveTaskMappings,
-  startRegistryCleanup,
   stopRegistryCleanup,
 } from "./webhook-handler.js";
 import type { PaperclipApiClient } from "./webhook-handler.js";
