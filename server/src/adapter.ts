@@ -1003,9 +1003,145 @@ export function processIncomingMessage(
   return formatAgentResponse(senderName, message.content);
 }
 
+// ─── Canonical Paperclip adapter contract ──────────────────────────────────
+// Matches the canonical adapter shape Paperclip expects per
+// `paperclipai/paperclip/doc/SPEC-implementation.md` and the reference
+// `NousResearch/hermes-paperclip-adapter`. These named exports let the
+// package load via `~/.paperclip/adapter-plugins.json`.
+
+/** Paperclip skill shape (subset of the canonical Paperclip Skill). */
+export interface PaperclipSkill {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+/**
+ * Detect a sensible default model/provider for the configured Agrenting agent.
+ * Paperclip calls this to pre-populate the adapter UI when an agent is
+ * created. Returns null if no info is available.
+ */
+export async function detectModel(
+  config: Pick<AgrentingAdapterConfig, "agrentingUrl" | "apiKey" | "agentDid">
+): Promise<{ provider: string; model: string } | null> {
+  if (!config.agentDid) return null;
+  try {
+    const profile = await getAgentProfile(config as AgrentingAdapterConfig, config.agentDid);
+    const provider = (profile as { ai_provider?: string }).ai_provider ?? null;
+    const model = (profile as { ai_model?: string }).ai_model ?? null;
+    if (provider && model) return { provider, model };
+  } catch {
+    // Surface as "no detection" rather than a hard error — Paperclip falls
+    // back to user input.
+  }
+  return null;
+}
+
+/**
+ * Enumerate the configured Agrenting agent's capabilities and map them to
+ * Paperclip's Skill shape.
+ */
+export async function listSkills(
+  config: AgrentingAdapterConfig
+): Promise<PaperclipSkill[]> {
+  const profile = await getAgentProfile(config, config.agentDid);
+  const capabilities = profile.capabilities ?? [];
+  return capabilities.map((cap) => ({
+    id: `${config.agentDid}:${cap}`,
+    name: cap,
+    description: `Capability "${cap}" of agent ${config.agentDid}`,
+  }));
+}
+
+/**
+ * Reconcile the agent's current capabilities against Paperclip's local skill
+ * registry. Returns sets to add and remove.
+ */
+export async function syncSkills(
+  config: AgrentingAdapterConfig,
+  existing: PaperclipSkill[]
+): Promise<{ added: PaperclipSkill[]; removed: PaperclipSkill[] }> {
+  const remote = await listSkills(config);
+  const remoteIds = new Set(remote.map((s) => s.id));
+  const existingIds = new Set(existing.map((s) => s.id));
+  return {
+    added: remote.filter((s) => !existingIds.has(s.id)),
+    removed: existing.filter((s) => !remoteIds.has(s.id)),
+  };
+}
+
+/**
+ * Session codec — Paperclip uses this to serialise session state across
+ * heartbeats. Hirings carry no rich session state, so we pass JSON through.
+ */
+export const sessionCodec = {
+  encode(state: unknown): string {
+    return JSON.stringify(state ?? null);
+  },
+  decode(blob: string | null | undefined): unknown {
+    if (!blob) return null;
+    try {
+      return JSON.parse(blob);
+    } catch {
+      return null;
+    }
+  },
+};
+
+/**
+ * Canonical `AgentAdapter.invoke`. Forwards to {@link execute}.
+ */
+export async function invoke(
+  config: AgrentingAdapterConfig,
+  params: {
+    input: string;
+    capability: string;
+    instructions?: string;
+    maxPrice?: string;
+    paymentType?: string;
+  }
+): Promise<AgrentingExecutionResult> {
+  return execute(config, params);
+}
+
+/**
+ * Canonical `AgentAdapter.status`. Returns the current run status.
+ */
+export async function status(
+  config: AgrentingAdapterConfig,
+  taskId: string
+): Promise<{
+  status: AgrentingTaskStatus;
+  progressPercent: number;
+  progressMessage?: string;
+}> {
+  const progress = await getTaskProgress(config, taskId);
+  return {
+    status: progress.status,
+    progressPercent: progress.progressPercent,
+    progressMessage: progress.progressMessage,
+  };
+}
+
+/**
+ * Canonical `AgentAdapter.cancel`. Cancels a running task; throws on failure
+ * so Paperclip can treat the call as a void Promise.
+ */
+export async function cancel(
+  config: AgrentingAdapterConfig,
+  taskId: string
+): Promise<void> {
+  const result = await cancelTask(config, taskId);
+  if (!result.success) {
+    throw new Error(result.error ?? "Failed to cancel task");
+  }
+}
+
 /**
  * Create the server-side adapter module.
- * This is the entry point for Paperclip's server adapter registry.
+ * Backward-compat convenience for callers that prefer a single bundle. New
+ * Paperclip plugin loaders should use the named exports directly via
+ * `~/.paperclip/adapter-plugins.json`.
  */
 export function createServerAdapter() {
   return {
@@ -1040,5 +1176,13 @@ export function createServerAdapter() {
     getTransactions,
     deposit,
     withdraw,
+    // Canonical contract additions:
+    invoke,
+    status,
+    cancel,
+    detectModel,
+    listSkills,
+    syncSkills,
+    sessionCodec,
   };
 }

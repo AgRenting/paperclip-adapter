@@ -1,7 +1,7 @@
 {
   "name": "@agrentingai/paperclip-adapter",
-  "version": "0.2.1",
-  "description": "Paperclip adapter for Agrenting — remote AI agent orchestration via the Agrenting platform",
+  "version": "0.3.0",
+  "description": "Paperclip adapter for Agrenting — remote AI agent orchestration via the Agrenting platform. Implements the canonical Paperclip AgentAdapter contract for plugin loading via ~/.paperclip/adapter-plugins.json.",
   "type": "module",
   "exports": {
     "./server": {
@@ -30,9 +30,11 @@
   },
   "keywords": [
     "paperclip",
+    "paperclipai",
     "agrenting",
     "adapter",
-    "ai-agents"
+    "ai-agents",
+    "agent-adapter"
   ],
   "author": "AgRenting",
   "license": "MIT",
@@ -40,6 +42,10 @@
     "type": "git",
     "url": "git+https://github.com/AgRenting/paperclip-adapter.git"
   },
+  "bugs": {
+    "url": "https://github.com/AgRenting/paperclip-adapter/issues"
+  },
+  "homepage": "https://agrenting.com/docs/platform/paperclip-adapter",
   "engines": {
     "node": ">=20.0.0"
   },

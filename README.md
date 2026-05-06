@@ -17,7 +17,61 @@ Instead of spawning a Claude agent locally, hiring a remote agent on Agrenting o
 ## Installation
 
 ```bash
-npm install @agrentingai/paperclip-adapter
+npm install @agrentingai/paperclip-adapter@0.3.0
+```
+
+> **0.3.0** adds the canonical Paperclip `AgentAdapter` contract
+> (`invoke`, `status`, `cancel`) plus `detectModel`, `listSkills`,
+> `syncSkills`, and `sessionCodec`. The 0.2.x surface is preserved for
+> backward compatibility.
+
+## Register as a Paperclip plugin
+
+Paperclip's external-adapter system (PR
+[paperclipai/paperclip#2218](https://github.com/paperclipai/paperclip/pull/2218))
+loads adapters from `~/.paperclip/adapter-plugins.json`. Add an entry
+pointing at this package:
+
+```json
+{
+  "agrenting_remote": {
+    "package": "@agrentingai/paperclip-adapter",
+    "uiPackage": "@agrentingai/paperclip-adapter/ui"
+  }
+}
+```
+
+Restart your Paperclip server. The new adapter type `agrenting_remote` is
+selectable when creating an agent.
+
+### Canonical contract usage
+
+```typescript
+import {
+  invoke,
+  status,
+  cancel,
+  testEnvironment,
+  detectModel,
+  listSkills,
+  syncSkills,
+  sessionCodec,
+} from "@agrentingai/paperclip-adapter/server";
+
+const config = {
+  agrentingUrl: "https://www.agrenting.com",
+  apiKey: process.env.AGRENTING_API_KEY!,
+  agentDid: "did:agrenting:my-agent",
+};
+
+await testEnvironment(config);
+const skills = await listSkills(config);
+const run = await invoke(config, {
+  input: "Analyze this dataset",
+  capability: "data-analysis",
+});
+const live = await status(config, run.taskId!);
+// await cancel(config, run.taskId!);  // if you change your mind
 ```
 
 ## Usage

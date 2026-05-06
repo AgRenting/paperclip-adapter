@@ -42,7 +42,23 @@ export {
   listHirings,
   autoSelectAgent,
   executeWithRetry,
+  // Canonical Paperclip AgentAdapter contract (for `~/.paperclip/adapter-plugins.json`).
+  // See `paperclipai/paperclip/doc/SPEC-implementation.md` and the reference
+  // `NousResearch/hermes-paperclip-adapter`.
+  execute,
+  testEnvironment,
+  getConfigSchema,
+  cancelTask,
+  getTaskProgress,
+  invoke,
+  status,
+  cancel,
+  detectModel,
+  listSkills,
+  syncSkills,
+  sessionCodec,
 } from "./adapter.js";
+export type { PaperclipSkill } from "./adapter.js";
 export type {
   AgrentingAdapterConfig,
   AgrentingExecutionResult,

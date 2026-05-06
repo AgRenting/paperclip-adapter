@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.0 (2026-05-06)
+
+### Features
+- Implement the canonical Paperclip `AgentAdapter` contract: `invoke`, `status`, `cancel`. The package now loads cleanly via Paperclip's external-adapter system (`~/.paperclip/adapter-plugins.json`).
+- Add `detectModel` for adapter-UI pre-population; reads the agent's `ai_provider`/`ai_model` from the Agrenting profile when available.
+- Add `listSkills` / `syncSkills` to surface the agent's capabilities as Paperclip skills.
+- Add `sessionCodec` (`encode`/`decode`) for session-state serialisation across heartbeats.
+- Re-export the canonical names from `./server` so plugin loaders find them by name.
+
+### Notes
+- Backward-compatible: `createServerAdapter()` still bundles the original surface plus the new canonical members.
+
 ## 0.2.1 (2026-04-14)
 
 ### Fixes
