@@ -511,6 +511,16 @@ describe("AgrentingClient", () => {
   // -------------------------------------------------------------------------
 
   describe("retry logic", () => {
+    it("does not retry non-retryable 4xx responses", async () => {
+      const client = new AgrentingClient(mockConfig);
+      const fn = mockFetchResponse(422, "Invalid hiring payload");
+
+      await expect(client.getTask("bad-request")).rejects.toThrow(
+        "Agrenting API 422"
+      );
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
     it("retries on 500 errors and succeeds on retry", async () => {
       const client = new AgrentingClient(mockConfig);
       const fn = vi.fn()
@@ -631,44 +641,80 @@ describe("AgrentingClient", () => {
   // -------------------------------------------------------------------------
 
   describe("hireAgent", () => {
-    it("hires an agent and returns adapter config", async () => {
+    it("creates a canonical hiring and returns its config", async () => {
       const client = new AgrentingClient(mockConfig);
       mockFetchResponse(200, {
         data: {
-          agent_did: "did:agrenting:hire-me",
-          adapter_config: {
-            agrentingUrl: "https://www.agrenting.com",
+          hiring: {
+            id: "hiring-1",
+            agent_did: "did:agrenting:hire-me",
+            status: "paid",
+            price: "8.50",
+            capability_requested: "code-review",
+            task_description: "Review the authentication changes",
+            delivery_mode: "output",
+          },
+          config: {
             agentDid: "did:agrenting:hire-me",
             pricingModel: "fixed",
+            basePrice: "8.50",
+            capabilities: ["code-review"],
+            hiringId: "hiring-1",
           },
-          status: "hired",
-          hired_at: "2026-04-13T10:00:00Z",
         },
       });
 
-      const result = await client.hireAgent("did:agrenting:hire-me");
+      const result = await client.hireAgent("did:agrenting:hire-me", {
+        taskDescription: "Review the authentication changes",
+        capabilityRequested: "code-review",
+        price: "8.50",
+      });
 
-      expect(result.agent_did).toBe("did:agrenting:hire-me");
-      expect(result.status).toBe("hired");
-      expect(result.adapter_config.pricingModel).toBe("fixed");
+      expect(result.hiring.id).toBe("hiring-1");
+      expect(result.hiring.status).toBe("paid");
+      expect(result.config.pricingModel).toBe("fixed");
     });
 
-    it("sends pricing model in request body", async () => {
+    it("sends the complete marketplace hiring payload", async () => {
       const client = new AgrentingClient(mockConfig);
       mockFetchResponse(200, {
         data: {
-          agent_did: "did:agrenting:x",
-          adapter_config: { agrentingUrl: "https://www.agrenting.com", agentDid: "did:agrenting:x", pricingModel: "per-token" },
-          status: "hired",
-          hired_at: "2026-04-13T10:00:00Z",
+          hiring: { id: "hiring-2", status: "paid" },
+          config: {
+            agentDid: "did:agrenting:x",
+            pricingModel: "fixed",
+            basePrice: "12.00",
+            capabilities: ["implementation"],
+            hiringId: "hiring-2",
+          },
         },
       });
 
-      await client.hireAgent("did:agrenting:x", { pricingModel: "per-token" });
+      await client.hireAgent("did:agrenting:x", {
+        taskDescription: "Implement the requested feature",
+        capabilityRequested: "implementation",
+        price: 12,
+        deliveryMode: "push",
+        repoUrl: "https://github.com/example/repo",
+        repoAccessToken: "github-secret",
+        clientIdempotencyKey: "paperclip-run-123",
+        taskInput: { issue_id: "issue-1" },
+        clientMessage: "Start with the failing test.",
+      });
 
       const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
       const body = JSON.parse(call[1].body);
-      expect(body.pricing_model).toBe("per-token");
+      expect(body).toEqual({
+        task_description: "Implement the requested feature",
+        capability_requested: "implementation",
+        price: "12",
+        delivery_mode: "push",
+        repo_url: "https://github.com/example/repo",
+        repo_access_token: "github-secret",
+        client_idempotency_key: "paperclip-run-123",
+        task_input: { issue_id: "issue-1" },
+        client_message: "Start with the failing test.",
+      });
     });
   });
 
@@ -836,19 +882,23 @@ describe("AgrentingClient", () => {
   });
 
   describe("getHiringMessages", () => {
-    it("GETs messages for a hiring", async () => {
+    it("reads messages embedded in the canonical hiring detail", async () => {
       const client = new AgrentingClient(mockConfig);
       mockFetchResponse(200, {
-        data: [
-          { id: "msg-1", hiring_id: "h-123", sender_agent_id: "client-1", content: "Hello", created_at: "2025-01-01T00:00:00Z" },
-        ],
+        data: {
+          id: "h-123",
+          status: "in_progress",
+          messages: [
+            { id: "msg-1", sender_type: "user", content: "Hello", inserted_at: "2025-01-01T00:00:00Z" },
+          ],
+        },
       });
 
       const result = await client.getHiringMessages("h-123");
 
       expect(result).toHaveLength(1);
       expect(fetch).toHaveBeenCalledWith(
-        "https://api.agrenting.com/api/v1/hirings/h-123/messages",
+        "https://api.agrenting.com/api/v1/hirings/h-123",
         expect.objectContaining({ method: "GET" })
       );
     });
@@ -912,18 +962,46 @@ describe("AgrentingClient", () => {
     it("GETs hirings list with filters", async () => {
       const client = new AgrentingClient(mockConfig);
       mockFetchResponse(200, {
-        data: [
-          { id: "h-1", agent_id: "agent-1", status: "active", created_at: "2025-01-01T00:00:00Z" },
-          { id: "h-2", agent_id: "agent-2", status: "completed", created_at: "2025-01-02T00:00:00Z" },
-        ],
+        data: {
+          hirings: [
+            { id: "h-1", status: "in_progress" },
+            { id: "h-2", status: "completed" },
+          ],
+          total: 2,
+          page: 2,
+          per_page: 10,
+          total_pages: 2,
+        },
       });
 
-      const result = await client.listHirings({ status: "active", limit: 10 });
+      const result = await client.listHirings({
+        status: "in_progress",
+        limit: 10,
+        offset: 10,
+      });
 
       expect(result).toHaveLength(2);
       const url = (fetch as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
-      expect(url).toContain("status=active");
+      expect(url).toContain("status=in_progress");
       expect(url).toContain("limit=10");
+      expect(url).toContain("page=2");
+    });
+  });
+
+  describe("cancelHiring", () => {
+    it("POSTs to the canonical cancellation endpoint", async () => {
+      const client = new AgrentingClient(mockConfig);
+      mockFetchResponse(200, {
+        data: { id: "h-123", status: "cancelled", final: true },
+      });
+
+      const result = await client.cancelHiring("h-123");
+
+      expect(result.status).toBe("cancelled");
+      expect(fetch).toHaveBeenCalledWith(
+        "https://api.agrenting.com/api/v1/hirings/h-123/cancel",
+        expect.objectContaining({ method: "POST" })
+      );
     });
   });
 

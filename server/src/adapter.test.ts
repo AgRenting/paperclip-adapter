@@ -110,9 +110,21 @@ beforeEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("createServerAdapter", () => {
-  it("returns adapter with name 'agrenting'", () => {
+  it("returns the canonical Paperclip adapter while preserving legacy helpers", () => {
     const adapter = createServerAdapter();
+    expect(adapter.type).toBe("agrenting");
     expect(adapter.name).toBe("agrenting");
+    expect(adapter.execute).not.toBe(execute);
+    expect(adapter.legacyExecute).toBe(execute);
+    expect(adapter.legacyTestEnvironment).toBe(testEnvironment);
+    expect(adapter.getLegacyConfigSchema).toBe(getConfigSchema);
+    expect(adapter.legacyDetectModel).toBeTypeOf("function");
+    expect(adapter.legacyListSkills).toBeTypeOf("function");
+    expect(adapter.legacySyncSkills).toBeTypeOf("function");
+    const adapterRecord = adapter as Record<string, unknown>;
+    expect(adapterRecord.detectModel).toBeUndefined();
+    expect(adapterRecord.listSkills).toBeUndefined();
+    expect(adapterRecord.syncSkills).toBeUndefined();
   });
 
   it("exposes all required methods", () => {

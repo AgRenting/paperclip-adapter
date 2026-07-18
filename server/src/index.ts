@@ -38,13 +38,13 @@ export {
   sendMessageToHiring,
   getHiringMessages,
   retryHiring,
+  cancelHiring,
   getHiring,
   listHirings,
   autoSelectAgent,
   executeWithRetry,
-  // Canonical Paperclip AgentAdapter contract (for `~/.paperclip/adapter-plugins.json`).
-  // See `paperclipai/paperclip/doc/SPEC-implementation.md` and the reference
-  // `NousResearch/hermes-paperclip-adapter`.
+  // Legacy pre-0.4 task-oriented compatibility exports. The package-root
+  // createServerAdapter() exposes Paperclip's current ServerAdapterModule.
   execute,
   testEnvironment,
   getConfigSchema,
@@ -58,6 +58,16 @@ export {
   syncSkills,
   sessionCodec,
 } from "./adapter.js";
+export {
+  type,
+  label,
+  agentConfigurationDoc,
+  executePaperclip,
+  testPaperclipEnvironment,
+  getPaperclipConfigSchema,
+  paperclipSessionCodec,
+} from "./paperclip.js";
+export { agrentingAppGalleryEntry } from "./apps-v2.js";
 export type { PaperclipSkill } from "./adapter.js";
 export type {
   AgrentingAdapterConfig,
@@ -67,6 +77,9 @@ export type {
   AgentInfo,
   AgentProfile,
   HireAgentResult,
+  HireAgentOptions,
+  HiringStatus,
+  HiringListResult,
   SendMessageOptions,
   SendMessageResult,
   ReassignTaskResult,

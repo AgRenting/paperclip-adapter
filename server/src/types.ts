@@ -17,6 +17,16 @@ export interface AgrentingAdapterConfig {
   pricingModel?: "fixed" | "per-token" | "subscription";
   /** Task timeout in seconds (default: 600) */
   timeoutSec?: number;
+  /** Default capability used by the canonical Paperclip hiring adapter. */
+  capabilityRequested?: string;
+  /** Price offered for each hiring. Defaults to the selected agent's base price. */
+  price?: string;
+  /** Poll interval for the hiring lifecycle in milliseconds (default: 2000). */
+  pollIntervalMs?: number;
+  /** Agrenting delivery mode for canonical Paperclip runs. */
+  deliveryMode?: "output" | "push";
+  /** Repository URL used for push delivery. */
+  repoUrl?: string;
   /** How instructions are handled: "managed" (uploaded to Agrenting) or "inline" (passed in task context) */
   instructionsBundleMode?: "managed" | "inline";
 }
@@ -126,7 +136,7 @@ export interface AgentProfile {
   name: string;
   description?: string;
   capabilities: string[];
-  pricing_tiers: Array<{
+  pricing_tiers?: Array<{
     model: string;
     price_per_task?: string;
     price_per_token?: string;
@@ -138,41 +148,102 @@ export interface AgentProfile {
     average_rating: number;
     total_reviews: number;
   };
-  reputation_score?: number;
+  reputation_score?: number | string;
   total_earnings?: string;
   verified?: boolean;
   response_time_avg?: number;
-  availability_status: "available" | "busy" | "offline";
+  availability_status?: "available" | "busy" | "offline";
+  availability?: string;
+  status?: string;
   success_rate?: number;
   total_tasks_completed?: number;
   metadata?: Record<string, unknown>;
   avatar_url?: string;
-  created_at: string;
+  created_at?: string;
 }
 
 /** Result of hiring an agent via POST /api/v1/agents/:did/hire */
 export interface HireAgentResult {
-  agent_did: string;
-  adapter_config: {
-    agrentingUrl: string;
+  hiring: Hiring;
+  config: {
     agentDid: string;
     pricingModel: string;
-    webhookSecret?: string;
+    basePrice: string;
+    capabilities: string[];
+    hiringId: string;
+    metadata?: Record<string, unknown>;
   };
-  status: "hired" | "pending_approval";
-  hired_at: string;
 }
 
-/** Hiring record returned by POST /api/v1/agents/:did/hire */
+/** Canonical payload required by POST /api/v1/agents/:did/hire. */
+export interface HireAgentOptions {
+  taskDescription: string;
+  capabilityRequested: string;
+  price: string | number;
+  repoUrl?: string;
+  repoAccessToken?: string;
+  deliveryMode?: "output" | "push";
+  clientIdempotencyKey?: string;
+  taskInput?: Record<string, unknown>;
+  clientMessage?: string;
+}
+
+export type HiringStatus =
+  | "pending_payment"
+  | "paid"
+  | "queued"
+  | "in_progress"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "disputed"
+  | "refunded"
+  | (string & {});
+
+/** Hiring record returned by the canonical Agrenting hiring REST API. */
 export interface Hiring {
   id: string;
-  agent_id: string;
-  agent_did: string;
-  client_agent_id: string;
-  status: string;
+  status: HiringStatus;
+  final?: boolean;
+  agent_id?: string;
+  agent_did?: string;
+  client_agent_id?: string;
+  agent?: {
+    id: string;
+    did: string;
+    name: string;
+    category?: string;
+    capabilities?: string[];
+    base_price?: string;
+    reputation_score?: string;
+    status?: string;
+  } | null;
+  price?: string | null;
+  capability_requested?: string;
+  task_description?: string;
+  delivery_mode?: "output" | "push" | string;
   pricing_model?: string;
-  created_at: string;
-  updated_at: string;
+  task_input?: Record<string, unknown>;
+  task_output?: Record<string, unknown> | string | null;
+  failed_reason?: string | null;
+  repo_url?: string | null;
+  messages?: HiringMessage[];
+  artifacts?: Array<Record<string, unknown>>;
+  started_at?: string | null;
+  completed_at?: string | null;
+  failed_at?: string | null;
+  deadline_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+/** Paginated response returned by GET /api/v1/hirings. */
+export interface HiringListResult {
+  hirings: Hiring[];
+  total: number;
+  page: number;
+  per_page: number;
+  total_pages: number;
 }
 
 /** Options for sending a message to a task */
@@ -213,10 +284,12 @@ export interface ReassignTaskResult {
 /** Hiring message for communication with hired agent */
 export interface HiringMessage {
   id: string;
-  hiring_id: string;
-  sender_agent_id: string;
+  hiring_id?: string;
+  sender_agent_id?: string;
+  sender_type?: string;
   content: string;
-  created_at: string;
+  created_at?: string;
+  inserted_at?: string;
   sender_name?: string;
 }
 
@@ -232,6 +305,7 @@ export interface Capability {
 /** Options for auto-selecting an agent */
 export interface AutoSelectOptions {
   capability: string;
+  taskDescription: string;
   maxPrice?: string;
   minReputation?: number;
   sortBy?: "reputation_score" | "base_price" | "availability";

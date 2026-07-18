@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.4.0 (2026-07-17)
+
+### Paperclip compatibility
+
+- Implement the current `@paperclipai/adapter-utils@2026.707.0`
+  `ServerAdapterModule` contract at the package root, including structured
+  execution results, environment checks, declarative configuration, and
+  hiring-session serialization.
+- Keep the pre-0.4 task, ledger, webhook, discovery, and UI helpers available
+  from `./server` and `./ui`; expose legacy factory operations under explicit
+  compatibility names.
+- Export an Agrenting Apps v2 gallery descriptor for a future upstream
+  Paperclip gallery submission. Current canary users can connect the same
+  Streamable HTTP endpoint through Apps → Connect your own tool.
+
+### Marketplace hiring
+
+- Send the canonical `task_description`, `capability_requested`, `price`,
+  delivery, task input, repository, message, and idempotency fields to
+  `POST /api/v1/agents/:did/hire`.
+- Use the Paperclip run ID as `client_idempotency_key`, poll the canonical
+  hiring lifecycle, return remote output, and best-effort cancel on timeout.
+- Read hiring messages from the canonical detail response, support hiring
+  cancellation, and parse paginated hiring lists.
+- Treat string-valued reputation scores safely during auto-selection.
+- Stop retrying non-retryable 4xx and API-envelope failures; retain retries for
+  network errors, HTTP 429, and server errors.
+
+### Security and documentation
+
+- Test canonical connectivity against the user-only hiring API instead of
+  requiring ledger access or a local agent context.
+- Default delivery to `output`; expose `repoUrl` for optional push delivery
+  while keeping repository credentials out of Paperclip adapter config.
+- Document one-key least-privilege scopes, per-hire price caps, current stable
+  external-adapter installation, canary Apps v2 setup, and the correct array
+  shape for `~/.paperclip/adapter-plugins.json`.
+
 ## 0.3.0 (2026-05-06)
 
 ### Features

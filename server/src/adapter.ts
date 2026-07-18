@@ -7,6 +7,7 @@ import type {
   AgentProfile,
   BalanceInfo as BalanceInfoRaw,
   HireAgentResult,
+  HireAgentOptions,
   PaymentInfo,
   ReassignTaskResult,
   SendMessageResult,
@@ -19,6 +20,10 @@ import type {
   Capability,
   AutoSelectOptions,
 } from "./types.js";
+import {
+  createCanonicalServerAdapter,
+  paperclipSessionCodec,
+} from "./paperclip.js";
 import { registerTaskMapping } from "./webhook-handler.js";
 import { pollTaskUntilDone } from "./polling.js";
 import { canSubmitTask } from "./balance-monitor.js";
@@ -670,10 +675,11 @@ const TASK_RETRY_MAX_DELAY_MS = 30_000; // 30s max delay
  */
 export async function hireAgent(
   config: AgrentingAdapterConfig,
-  agentDid: string
+  agentDid: string,
+  options: HireAgentOptions
 ): Promise<HireAgentResult> {
   const client = new AgrentingClient(config);
-  return client.hireAgent(agentDid);
+  return client.hireAgent(agentDid, options);
 }
 
 /**
@@ -793,6 +799,15 @@ export async function listHirings(
   return client.listHirings(options);
 }
 
+/** Cancel an active hiring and release its escrow according to Agrenting policy. */
+export async function cancelHiring(
+  config: AgrentingAdapterConfig,
+  hiringId: string
+): Promise<Hiring> {
+  const client = new AgrentingClient(config);
+  return client.cancelHiring(hiringId);
+}
+
 /**
  * Auto-select mode: given a capability requirement, discover the best agent,
  * hire them, and return the adapter config for immediate use.
@@ -842,7 +857,8 @@ export async function autoSelectAgent(
     const minRep = options.minReputation;
     filtered = filtered.filter((a) => {
       if (!a.reputation_score) return false; // No reputation = excluded
-      return a.reputation_score >= minRep;
+      const reputation = Number(a.reputation_score);
+      return Number.isFinite(reputation) && reputation >= minRep;
     });
   }
 
@@ -858,8 +874,14 @@ export async function autoSelectAgent(
   // Prefer available agents if requested
   if (options.preferAvailable ?? true) {
     filtered.sort((a, b) => {
-      const aAvail = a.availability_status === "available" ? 0 : 1;
-      const bAvail = b.availability_status === "available" ? 0 : 1;
+      const aAvail =
+        (a.availability_status ?? a.availability ?? a.status) === "available"
+          ? 0
+          : 1;
+      const bAvail =
+        (b.availability_status ?? b.availability ?? b.status) === "available"
+          ? 0
+          : 1;
       if (aAvail !== bAvail) return aAvail - bAvail;
       return 0;
     });
@@ -868,7 +890,12 @@ export async function autoSelectAgent(
   // Secondary sort
   filtered.sort((a, b) => {
     if (sortBy === "reputation_score") {
-      return (b.reputation_score ?? 0) - (a.reputation_score ?? 0);
+      const aReputation = Number(a.reputation_score ?? 0);
+      const bReputation = Number(b.reputation_score ?? 0);
+      return (
+        (Number.isFinite(bReputation) ? bReputation : 0) -
+        (Number.isFinite(aReputation) ? aReputation : 0)
+      );
     }
     if (sortBy === "base_price") {
       const aPrice = parseFloat(a.base_price ?? "999999");
@@ -876,8 +903,14 @@ export async function autoSelectAgent(
       return aPrice - bPrice;
     }
     if (sortBy === "availability") {
-      const aAvail = a.availability_status === "available" ? 0 : 1;
-      const bAvail = b.availability_status === "available" ? 0 : 1;
+      const aAvail =
+        (a.availability_status ?? a.availability ?? a.status) === "available"
+          ? 0
+          : 1;
+      const bAvail =
+        (b.availability_status ?? b.availability ?? b.status) === "available"
+          ? 0
+          : 1;
       return aAvail - bAvail;
     }
     return 0;
@@ -885,7 +918,12 @@ export async function autoSelectAgent(
 
   // 4. Hire the best agent
   const selectedAgent = filtered[0];
-  const hireResult = await client.hireAgent(selectedAgent.did);
+  const hireResult = await client.hireAgent(selectedAgent.did, {
+    taskDescription: options.taskDescription,
+    capabilityRequested: options.capability,
+    price: selectedAgent.base_price ?? options.maxPrice ?? "0",
+    deliveryMode: "output",
+  });
 
   // 5. Return combined result
   return {
@@ -1003,11 +1041,10 @@ export function processIncomingMessage(
   return formatAgentResponse(senderName, message.content);
 }
 
-// ─── Canonical Paperclip adapter contract ──────────────────────────────────
-// Matches the canonical adapter shape Paperclip expects per
-// `paperclipai/paperclip/doc/SPEC-implementation.md` and the reference
-// `NousResearch/hermes-paperclip-adapter`. These named exports let the
-// package load via `~/.paperclip/adapter-plugins.json`.
+// ─── Legacy pre-0.4 Paperclip compatibility surface ────────────────────────
+// Kept as named exports for callers that adopted the package's earlier
+// task-oriented adapter shape. The current package-root ServerAdapterModule is
+// implemented in paperclip.ts.
 
 /** Paperclip skill shape (subset of the canonical Paperclip Skill). */
 export interface PaperclipSkill {
@@ -1074,22 +1111,10 @@ export async function syncSkills(
  * Session codec — Paperclip uses this to serialise session state across
  * heartbeats. Hirings carry no rich session state, so we pass JSON through.
  */
-export const sessionCodec = {
-  encode(state: unknown): string {
-    return JSON.stringify(state ?? null);
-  },
-  decode(blob: string | null | undefined): unknown {
-    if (!blob) return null;
-    try {
-      return JSON.parse(blob);
-    } catch {
-      return null;
-    }
-  },
-};
+export const sessionCodec = paperclipSessionCodec;
 
 /**
- * Canonical `AgentAdapter.invoke`. Forwards to {@link execute}.
+ * Legacy `AgentAdapter.invoke`. Forwards to {@link execute}.
  */
 export async function invoke(
   config: AgrentingAdapterConfig,
@@ -1105,7 +1130,7 @@ export async function invoke(
 }
 
 /**
- * Canonical `AgentAdapter.status`. Returns the current run status.
+ * Legacy `AgentAdapter.status`. Returns the current run status.
  */
 export async function status(
   config: AgrentingAdapterConfig,
@@ -1124,7 +1149,7 @@ export async function status(
 }
 
 /**
- * Canonical `AgentAdapter.cancel`. Cancels a running task; throws on failure
+ * Legacy `AgentAdapter.cancel`. Cancels a running task; throws on failure
  * so Paperclip can treat the call as a void Promise.
  */
 export async function cancel(
@@ -1139,16 +1164,20 @@ export async function cancel(
 
 /**
  * Create the server-side adapter module.
- * Backward-compat convenience for callers that prefer a single bundle. New
- * Paperclip plugin loaders should use the named exports directly via
- * `~/.paperclip/adapter-plugins.json`.
+ * Paperclip plugin loaders call this factory from the package root. The
+ * current ServerAdapterModule members are combined with explicitly named
+ * compatibility helpers for pre-0.4 consumers.
  */
 export function createServerAdapter() {
+  const canonical = createCanonicalServerAdapter();
   return {
+    ...canonical,
     name: "agrenting" as const,
-    execute,
-    testEnvironment,
-    getConfigSchema,
+    // Legacy helpers remain available under explicit names. The canonical
+    // Paperclip keys above use AdapterExecutionContext and structured tests.
+    legacyExecute: execute,
+    legacyTestEnvironment: testEnvironment,
+    getLegacyConfigSchema: getConfigSchema,
     startWebhookListener,
     stopWebhookListener,
     registerWebhook,
@@ -1166,6 +1195,7 @@ export function createServerAdapter() {
     sendMessageToHiring,
     getHiringMessages,
     retryHiring,
+    cancelHiring,
     getHiring,
     listHirings,
     autoSelectAgent,
@@ -1176,13 +1206,12 @@ export function createServerAdapter() {
     getTransactions,
     deposit,
     withdraw,
-    // Canonical contract additions:
+    // Legacy pre-0.4 contract additions:
     invoke,
     status,
     cancel,
-    detectModel,
-    listSkills,
-    syncSkills,
-    sessionCodec,
+    legacyDetectModel: detectModel,
+    legacyListSkills: listSkills,
+    legacySyncSkills: syncSkills,
   };
 }

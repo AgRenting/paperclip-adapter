@@ -1,0 +1,578 @@
+import type {
+  AdapterConfigSchema,
+  AdapterEnvironmentCheck,
+  AdapterEnvironmentTestContext,
+  AdapterEnvironmentTestResult,
+  AdapterExecutionContext,
+  AdapterExecutionResult,
+  AdapterSessionCodec,
+  ServerAdapterModule,
+} from "@paperclipai/adapter-utils";
+import { AgrentingClient } from "./client.js";
+import type {
+  AgentProfile,
+  AgrentingAdapterConfig,
+  Hiring,
+} from "./types.js";
+
+export const type = "agrenting";
+export const label = "Agrenting";
+
+export const agentConfigurationDoc = `# agrenting agent configuration
+
+Adapter: agrenting
+
+Use when:
+- A Paperclip agent should delegate each heartbeat to a remote agent hired from Agrenting.
+- The operator has an Agrenting user API token and sufficient ledger balance.
+
+Core fields:
+- agrentingUrl (required): Agrenting base URL, normally https://agrenting.com
+- apiKey (required, secret): Agrenting user API token (ap_...)
+- agentDid (required): DID of the marketplace agent to hire
+- capabilityRequested (optional): defaults to the first capability on the agent profile
+- price (optional): defaults to the agent's current base price
+- timeoutSec (optional): maximum time to poll a hiring, default 600
+- pollIntervalMs (optional): hiring status poll interval, default 2000
+- deliveryMode (optional): output by default; push requires repository access
+- repoUrl (optional): repository URL used only when deliveryMode is push
+
+Recommended API-key scopes:
+- agents:discover, agents:read, hire:create, hirings:read, hirings:cancel
+- add balance:read and artifacts:read when sharing the key with Apps/Claude
+- deposits:create and account:read/account:write are optional elevated scopes
+- set max_price_per_hire on the key to cap paid actions
+
+Execution:
+- Each Paperclip run creates one canonical Agrenting hiring.
+- The Paperclip run id is sent as client_idempotency_key so safe retries deduplicate.
+- Paperclip polls the hiring until it completes, fails, is cancelled, or times out.
+- Push delivery can use a repository URL from Paperclip and an Agrenting-stored
+  GitHub token. The adapter never stores a repository token in agent config.
+`;
+
+const TERMINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "disputed",
+  "refunded",
+]);
+const DEFAULT_TIMEOUT_SEC = 600;
+const DEFAULT_POLL_INTERVAL_MS = 2_000;
+const MAX_TASK_DESCRIPTION_LENGTH = 5_000;
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function nonEmpty(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0
+    ? value.trim()
+    : null;
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function configFrom(raw: Record<string, unknown>): AgrentingAdapterConfig {
+  return {
+    agrentingUrl: nonEmpty(raw.agrentingUrl) ?? "https://agrenting.com",
+    apiKey: nonEmpty(raw.apiKey) ?? "",
+    agentDid: nonEmpty(raw.agentDid) ?? "",
+    capabilityRequested: nonEmpty(raw.capabilityRequested) ?? undefined,
+    price: nonEmpty(raw.price) ?? undefined,
+    timeoutSec: positiveNumber(raw.timeoutSec, DEFAULT_TIMEOUT_SEC),
+    pollIntervalMs: positiveNumber(
+      raw.pollIntervalMs,
+      DEFAULT_POLL_INTERVAL_MS
+    ),
+    deliveryMode: raw.deliveryMode === "push" ? "push" : "output",
+    repoUrl: nonEmpty(raw.repoUrl) ?? undefined,
+  };
+}
+
+function taskDescriptionFrom(ctx: AdapterExecutionContext): string {
+  const context = ctx.context;
+  const title =
+    nonEmpty(context.taskTitle) ??
+    nonEmpty(context.issueTitle) ??
+    nonEmpty(context.title);
+  const body =
+    nonEmpty(context.paperclipTaskMarkdown) ??
+    nonEmpty(context.taskBody) ??
+    nonEmpty(context.taskDescription) ??
+    nonEmpty(context.issueDescription) ??
+    nonEmpty(context.prompt) ??
+    nonEmpty(context.input);
+
+  let description = [title, body].filter(Boolean).join("\n\n").trim();
+  if (!description) {
+    description = `Continue the assigned Paperclip work for ${ctx.agent.name}.`;
+  }
+  if (description.length <= MAX_TASK_DESCRIPTION_LENGTH) return description;
+  return `${description.slice(0, MAX_TASK_DESCRIPTION_LENGTH - 32)}\n\n[truncated by Paperclip adapter]`;
+}
+
+function capabilityFrom(
+  config: AgrentingAdapterConfig,
+  context: Record<string, unknown>,
+  profile: AgentProfile
+): string | null {
+  return (
+    nonEmpty(config.capabilityRequested) ??
+    nonEmpty(context.capabilityRequested) ??
+    nonEmpty(context.capability) ??
+    profile.capabilities.find((capability) => capability.trim().length > 0) ??
+    null
+  );
+}
+
+function priceFrom(
+  config: AgrentingAdapterConfig,
+  context: Record<string, unknown>,
+  profile: AgentProfile
+): string | null {
+  return (
+    nonEmpty(config.price) ??
+    nonEmpty(context.price) ??
+    nonEmpty(context.maxPrice) ??
+    nonEmpty(profile.base_price)
+  );
+}
+
+function repoUrlFrom(ctx: AdapterExecutionContext): string | undefined {
+  const workspace = asRecord(ctx.context.paperclipWorkspace);
+  return (
+    nonEmpty(configFrom(ctx.config).repoUrl) ??
+    nonEmpty(workspace?.repoUrl) ??
+    undefined
+  );
+}
+
+function taskInputFrom(ctx: AdapterExecutionContext): Record<string, unknown> {
+  const input: Record<string, unknown> = {
+    paperclip_run_id: ctx.runId,
+    paperclip_agent_id: ctx.agent.id,
+    paperclip_company_id: ctx.agent.companyId,
+  };
+  const mappings: Array<[string, unknown]> = [
+    ["paperclip_issue_id", ctx.context.issueId ?? ctx.context.taskId],
+    ["paperclip_project_id", ctx.context.projectId],
+    ["paperclip_wake_reason", ctx.context.wakeReason],
+  ];
+  for (const [key, value] of mappings) {
+    const normalized = nonEmpty(value);
+    if (normalized) input[key] = normalized;
+  }
+  const wake = asRecord(ctx.context.paperclipWake);
+  if (wake) input.paperclip_wake = wake;
+  return input;
+}
+
+function outputText(hiring: Hiring): string {
+  const output = hiring.task_output;
+  if (typeof output === "string" && output.trim()) return output;
+  const record = asRecord(output);
+  if (record) {
+    for (const key of ["result", "output", "text", "summary"]) {
+      const direct = nonEmpty(record[key]);
+      if (direct) return direct;
+    }
+    return JSON.stringify(record, null, 2);
+  }
+  return `Agrenting hiring ${hiring.id} completed.`;
+}
+
+function firstLine(value: string): string {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) ?? "Agrenting hiring completed";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function resultForFailure(
+  hiring: Hiring,
+  message: string
+): AdapterExecutionResult {
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorMessage: message,
+    errorCode: `agrenting_hiring_${hiring.status}`,
+    provider: "agrenting",
+    biller: "agrenting",
+    sessionParams: { hiringId: hiring.id },
+    sessionDisplayId: hiring.id,
+    resultJson: {
+      hiringId: hiring.id,
+      status: hiring.status,
+      failedReason: hiring.failed_reason ?? null,
+    },
+  };
+}
+
+/** Canonical Paperclip ServerAdapterModule execution entry point. */
+export async function executePaperclip(
+  ctx: AdapterExecutionContext
+): Promise<AdapterExecutionResult> {
+  const config = configFrom(ctx.config);
+  if (!config.apiKey || !config.agentDid) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "agrenting_config_invalid",
+      errorMessage: "Agrenting requires apiKey and agentDid.",
+    };
+  }
+
+  const client = new AgrentingClient(config);
+  try {
+    const profile = await client.getAgentProfile(config.agentDid);
+    const capability = capabilityFrom(config, ctx.context, profile);
+    const price = priceFrom(config, ctx.context, profile);
+    if (!capability) {
+      throw new Error(
+        "No capabilityRequested was configured and the Agrenting agent profile has no capabilities."
+      );
+    }
+    if (!price) {
+      throw new Error(
+        "No price was configured and the Agrenting agent profile has no base_price."
+      );
+    }
+
+    const taskDescription = taskDescriptionFrom(ctx);
+    await ctx.onLog(
+      "stdout",
+      `[agrenting] Hiring ${config.agentDid} for ${capability} at ${price}\n`
+    );
+    const created = await client.hireAgent(config.agentDid, {
+      taskDescription,
+      capabilityRequested: capability,
+      price,
+      deliveryMode: config.deliveryMode,
+      clientIdempotencyKey: ctx.runId,
+      taskInput: taskInputFrom(ctx),
+      repoUrl: repoUrlFrom(ctx),
+    });
+    const hiringId = created.hiring.id;
+    await ctx.onMeta?.({
+      adapterType: type,
+      command: "POST /api/v1/agents/:did/hire",
+      context: { hiringId, agentDid: config.agentDid, capability, price },
+    });
+    await ctx.onLog(
+      "stdout",
+      `[agrenting] Hiring ${hiringId} created with status ${created.hiring.status}\n`
+    );
+
+    const timeoutMs = (config.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1_000;
+    const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const deadline = Date.now() + timeoutMs;
+    let hiring = created.hiring;
+    let lastStatus = hiring.status;
+
+    while (!TERMINAL_STATUSES.has(hiring.status) && Date.now() < deadline) {
+      await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())));
+      hiring = await client.getHiring(hiringId);
+      if (hiring.status !== lastStatus) {
+        lastStatus = hiring.status;
+        await ctx.onLog(
+          "stdout",
+          `[agrenting] Hiring ${hiringId} is ${hiring.status}\n`
+        );
+      }
+    }
+
+    if (!TERMINAL_STATUSES.has(hiring.status)) {
+      try {
+        await client.cancelHiring(hiringId);
+        await ctx.onLog(
+          "stderr",
+          `[agrenting] Hiring ${hiringId} timed out and was cancelled\n`
+        );
+      } catch (cancelError) {
+        await ctx.onLog(
+          "stderr",
+          `[agrenting] Hiring ${hiringId} timed out; cancellation failed: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}\n`
+        );
+      }
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: true,
+        errorCode: "agrenting_hiring_timeout",
+        errorMessage: `Agrenting hiring ${hiringId} timed out after ${config.timeoutSec ?? DEFAULT_TIMEOUT_SEC}s.`,
+        provider: "agrenting",
+        biller: "agrenting",
+        sessionParams: { hiringId },
+        sessionDisplayId: hiringId,
+      };
+    }
+
+    if (hiring.status !== "completed") {
+      return resultForFailure(
+        hiring,
+        hiring.failed_reason ?? `Agrenting hiring ended with status ${hiring.status}.`
+      );
+    }
+
+    const output = outputText(hiring);
+    await ctx.onLog("stdout", `${output}\n`);
+    const numericPrice = Number(hiring.price ?? price);
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "agrenting",
+      biller: "agrenting",
+      billingType: "fixed",
+      costUsd: Number.isFinite(numericPrice) ? numericPrice : null,
+      sessionParams: { hiringId },
+      sessionDisplayId: hiringId,
+      summary: firstLine(output),
+      resultJson: {
+        hiringId,
+        status: hiring.status,
+        taskOutput: hiring.task_output ?? null,
+      },
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const transient = /\b(429|5\d\d)\b|rate.?limit|temporar|timeout/i.test(message);
+    await ctx.onLog("stderr", `[agrenting] ${message}\n`);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: "agrenting_hiring_failed",
+      errorFamily: transient ? "transient_upstream" : null,
+      errorMessage: message,
+      provider: "agrenting",
+      biller: "agrenting",
+    };
+  }
+}
+
+function summarizeChecks(
+  checks: AdapterEnvironmentCheck[]
+): AdapterEnvironmentTestResult["status"] {
+  if (checks.some((check) => check.level === "error")) return "fail";
+  if (checks.some((check) => check.level === "warn")) return "warn";
+  return "pass";
+}
+
+/** Canonical structured environment test used by Paperclip. */
+export async function testPaperclipEnvironment(
+  ctx: AdapterEnvironmentTestContext
+): Promise<AdapterEnvironmentTestResult> {
+  const config = configFrom(ctx.config);
+  const checks: AdapterEnvironmentCheck[] = [];
+
+  let parsedUrl: URL | null = null;
+  try {
+    parsedUrl = new URL(config.agrentingUrl);
+    if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+      parsedUrl = null;
+    }
+  } catch {
+    parsedUrl = null;
+  }
+  if (!parsedUrl) {
+    checks.push({
+      code: "agrenting_url_invalid",
+      level: "error",
+      message: "agrentingUrl must be an http:// or https:// URL.",
+    });
+  }
+  if (!config.apiKey) {
+    checks.push({
+      code: "agrenting_api_key_missing",
+      level: "error",
+      message: "Agrenting requires a user API token.",
+      hint: "Create an ap_... token in Agrenting and store it as a Paperclip secret.",
+    });
+  }
+  if (!config.agentDid) {
+    checks.push({
+      code: "agrenting_agent_did_missing",
+      level: "error",
+      message: "Agrenting requires agentDid.",
+    });
+  }
+
+  if (!checks.some((check) => check.level === "error")) {
+    const client = new AgrentingClient(config);
+    let connectionOk = false;
+    try {
+      await client.listHirings({ limit: 1 });
+      connectionOk = true;
+      checks.push({
+        code: "agrenting_connection_ok",
+        level: "info",
+        message: "Connected to the authenticated Agrenting hiring API.",
+      });
+    } catch (error) {
+      checks.push({
+        code: "agrenting_connection_failed",
+        level: "error",
+        message: "Could not access the authenticated Agrenting hiring API.",
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (connectionOk) {
+      try {
+        const profile = await client.getAgentProfile(config.agentDid);
+        checks.push({
+          code: "agrenting_agent_profile_ok",
+          level: "info",
+          message: `Found Agrenting agent ${profile.name} (${profile.did}).`,
+          detail: `${profile.capabilities.length} capabilities; base price ${profile.base_price ?? "not reported"}.`,
+        });
+      } catch (error) {
+        checks.push({
+          code: "agrenting_agent_profile_failed",
+          level: "error",
+          message: `Could not load Agrenting agent ${config.agentDid}.`,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  }
+
+  return {
+    adapterType: ctx.adapterType,
+    status: summarizeChecks(checks),
+    checks,
+    testedAt: new Date().toISOString(),
+  };
+}
+
+export function getPaperclipConfigSchema(): AdapterConfigSchema {
+  return {
+    fields: [
+      {
+        key: "agrentingUrl",
+        label: "Agrenting URL",
+        type: "text",
+        required: true,
+        default: "https://agrenting.com",
+        hint: "Base URL of the Agrenting platform.",
+      },
+      {
+        key: "apiKey",
+        label: "API token",
+        type: "text",
+        required: true,
+        hint: "Agrenting user API token (ap_...). Stored as a Paperclip secret.",
+        meta: { secret: true },
+      },
+      {
+        key: "agentDid",
+        label: "Agent DID",
+        type: "text",
+        required: true,
+        hint: "Marketplace agent DID, for example did:agrenting:code-reviewer.",
+      },
+      {
+        key: "capabilityRequested",
+        label: "Capability",
+        type: "text",
+        hint: "Optional default. Falls back to the first capability on the agent profile.",
+      },
+      {
+        key: "price",
+        label: "Price per hiring (USD)",
+        type: "text",
+        hint: "Optional. Falls back to the agent's current base price.",
+      },
+      {
+        key: "timeoutSec",
+        label: "Timeout seconds",
+        type: "number",
+        default: DEFAULT_TIMEOUT_SEC,
+      },
+      {
+        key: "pollIntervalMs",
+        label: "Poll interval milliseconds",
+        type: "number",
+        default: DEFAULT_POLL_INTERVAL_MS,
+      },
+      {
+        key: "repoUrl",
+        label: "Repository URL",
+        type: "text",
+        hint: "Optional push target. Push delivery uses a GitHub token already stored in Agrenting.",
+      },
+      {
+        key: "deliveryMode",
+        label: "Delivery mode",
+        type: "select",
+        default: "output",
+        options: [
+          { value: "output", label: "Return output" },
+          { value: "push", label: "Push to repository" },
+        ],
+        hint: "Use output unless the hiring also has repository credentials.",
+      },
+    ],
+  };
+}
+
+type CompatibilitySessionCodec = AdapterSessionCodec & {
+  encode(state: unknown): string;
+  decode(blob: string | null | undefined): unknown;
+};
+
+export const paperclipSessionCodec: CompatibilitySessionCodec = {
+  deserialize(raw: unknown): Record<string, unknown> | null {
+    if (typeof raw === "string") {
+      try {
+        return asRecord(JSON.parse(raw));
+      } catch {
+        return null;
+      }
+    }
+    return asRecord(raw);
+  },
+  serialize(params: Record<string, unknown> | null): Record<string, unknown> | null {
+    return params;
+  },
+  getDisplayId(params: Record<string, unknown> | null): string | null {
+    return nonEmpty(params?.hiringId);
+  },
+  encode(state: unknown): string {
+    return JSON.stringify(state ?? null);
+  },
+  decode(blob: string | null | undefined): unknown {
+    if (!blob) return null;
+    try {
+      return JSON.parse(blob);
+    } catch {
+      return null;
+    }
+  },
+};
+
+export function createCanonicalServerAdapter() {
+  return {
+    type,
+    execute: executePaperclip,
+    testEnvironment: testPaperclipEnvironment,
+    sessionCodec: paperclipSessionCodec,
+    getConfigSchema: getPaperclipConfigSchema,
+    agentConfigurationDoc,
+  } satisfies ServerAdapterModule;
+}

@@ -4,6 +4,7 @@ import type {
   AgentInfo,
   AgentProfile,
   BalanceInfo,
+  HireAgentOptions,
   HireAgentResult,
   PaymentInfo,
   ReassignTaskResult,
@@ -13,6 +14,7 @@ import type {
   DiscoverAgentsOptions,
   CreateTaskPaymentOptions,
   Hiring,
+  HiringListResult,
   TaskMessage,
   HiringMessage,
   Capability,
@@ -21,6 +23,13 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 3;
+
+class NonRetryableAgrentingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NonRetryableAgrentingError";
+  }
+}
 
 /**
  * HTTP client for the Agrenting REST API.
@@ -87,18 +96,23 @@ export class AgrentingClient {
             continue;
           }
 
-          throw new Error(
+          throw new NonRetryableAgrentingError(
             `Agrenting API ${response.status}: ${text.slice(0, 500)}`
           );
         }
 
         const envelope = (await response.json()) as Record<string, unknown>;
         if (Array.isArray(envelope.errors) && envelope.errors.length) {
-          throw new Error(`API errors: ${(envelope.errors as string[]).join(", ")}`);
+          throw new NonRetryableAgrentingError(
+            `API errors: ${(envelope.errors as string[]).join(", ")}`
+          );
         }
         return (envelope.data ?? envelope) as T;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
+        if (lastError instanceof NonRetryableAgrentingError) {
+          throw lastError;
+        }
         if (attempt < MAX_RETRIES) {
           clearTimeout(timer);
           const delayMs = Math.min(1000 * 2 ** attempt, 30_000);
@@ -406,15 +420,26 @@ export class AgrentingClient {
     return this.request("GET", `/api/v1/agents/${encodeURIComponent(agentDid)}`);
   }
 
-  /** Hire/bind an agent to your account.
-   * Returns adapter config so Paperclip can auto-provision the agent.
+  /** Create a paid hiring for an agent.
+   * Agrenting requires a concrete task, capability, and offered price.
    */
   async hireAgent(
     agentDid: string,
-    options: { pricingModel?: string } = {}
+    options: HireAgentOptions
   ): Promise<HireAgentResult> {
-    const body: Record<string, unknown> = {};
-    if (options.pricingModel) body.pricing_model = options.pricingModel;
+    const body: Record<string, unknown> = {
+      task_description: options.taskDescription,
+      capability_requested: options.capabilityRequested,
+      price: String(options.price),
+      delivery_mode: options.deliveryMode ?? "output",
+    };
+    if (options.repoUrl) body.repo_url = options.repoUrl;
+    if (options.repoAccessToken) body.repo_access_token = options.repoAccessToken;
+    if (options.clientIdempotencyKey) {
+      body.client_idempotency_key = options.clientIdempotencyKey;
+    }
+    if (options.taskInput) body.task_input = options.taskInput;
+    if (options.clientMessage) body.client_message = options.clientMessage;
     return this.request(
       "POST",
       `/api/v1/agents/${encodeURIComponent(agentDid)}/hire`,
@@ -488,13 +513,11 @@ export class AgrentingClient {
   }
 
   /** Get messages for a hiring.
-   * GET /api/v1/hirings/:id/messages
+   * The canonical API includes recent messages in GET /api/v1/hirings/:id.
    */
   async getHiringMessages(hiringId: string): Promise<HiringMessage[]> {
-    return this.request<HiringMessage[]>(
-      "GET",
-      `/api/v1/hirings/${hiringId}/messages`
-    );
+    const hiring = await this.getHiring(hiringId);
+    return hiring.messages ?? [];
   }
 
   /** Retry a failed hiring.
@@ -522,6 +545,16 @@ export class AgrentingClient {
     return this.request<Hiring>("GET", `/api/v1/hirings/${hiringId}`);
   }
 
+  /** Cancel an active hiring.
+   * POST /api/v1/hirings/:id/cancel
+   */
+  async cancelHiring(hiringId: string): Promise<Hiring> {
+    return this.request<Hiring>(
+      "POST",
+      `/api/v1/hirings/${hiringId}/cancel`
+    );
+  }
+
   /** List hirings for the authenticated agent.
    * GET /api/v1/hirings
    */
@@ -533,9 +566,16 @@ export class AgrentingClient {
     const params = new URLSearchParams();
     if (options.status) params.set("status", options.status);
     if (options.limit) params.set("limit", String(options.limit));
-    if (options.offset) params.set("offset", String(options.offset));
+    if (options.offset) {
+      const perPage = options.limit ?? 20;
+      params.set("page", String(Math.floor(options.offset / perPage) + 1));
+    }
     const query = params.toString() ? `?${params}` : "";
-    return this.request<Hiring[]>("GET", `/api/v1/hirings${query}`);
+    const result = await this.request<HiringListResult>(
+      "GET",
+      `/api/v1/hirings${query}`
+    );
+    return result.hirings;
   }
 
   /** List agents filtered by capability for auto-select.

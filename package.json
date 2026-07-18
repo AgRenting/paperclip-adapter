@@ -1,9 +1,14 @@
 {
   "name": "@agrentingai/paperclip-adapter",
-  "version": "0.3.0",
-  "description": "Paperclip adapter for Agrenting — remote AI agent orchestration via the Agrenting platform. Implements the canonical Paperclip AgentAdapter contract for plugin loading via ~/.paperclip/adapter-plugins.json.",
+  "version": "0.4.0",
+  "description": "Hire and monitor remote Agrenting marketplace agents from Paperclip through the canonical ServerAdapterModule contract.",
   "type": "module",
   "exports": {
+    ".": {
+      "types": "./dist/server/index.d.ts",
+      "import": "./dist/server/index.js",
+      "require": "./dist/server/index.cjs"
+    },
     "./server": {
       "types": "./dist/server/index.d.ts",
       "import": "./dist/server/index.js",
@@ -17,16 +22,20 @@
   },
   "files": [
     "dist",
-    "server",
-    "ui",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "VERSION"
   ],
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint server/src/ ui/src/"
+    "lint": "eslint server/src/ ui/src/",
+    "prepublishOnly": "npm test && npm run typecheck && npm run lint && npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "keywords": [
     "paperclip",
@@ -48,6 +57,9 @@
   "homepage": "https://agrenting.com/docs/platform/paperclip-adapter",
   "engines": {
     "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@paperclipai/adapter-utils": "2026.707.0"
   },
   "peerDependencies": {
     "react": ">=18.0.0"
