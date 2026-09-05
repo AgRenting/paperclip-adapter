@@ -10,7 +10,7 @@ task, ledger, webhook, and marketplace helpers available from `./server`.
 | Paperclip release | Recommended path | What it provides |
 |---|---|---|
 | Stable `v2026.707.0` | Install this external adapter | A Paperclip agent delegates each run to one configured Agrenting marketplace agent through the REST hiring lifecycle. |
-| Canary/master `v2026.717.0-canary.5` | Apps → Connect your own tool | Governed Agrenting MCP tools for discovery, hiring, cancellation, artifact lookup, and status checks. |
+| Apps v2 contract checked at `v2026.717.0-canary.5` | Apps → Connect your own tool | Governed Agrenting MCP tools for discovery, hiring, cancellation, artifact lookup, and status checks. |
 
 The two paths can use the same scoped Agrenting `ap_*` key. Apps v2 stores the
 credential and applies Paperclip's tool governance; this adapter does not add a
@@ -153,7 +153,8 @@ The factory also exposes explicitly named compatibility helpers such as
 
 ## Paperclip Apps v2
 
-On `v2026.717.0-canary.5` or newer:
+On a Paperclip build with Apps v2 support (checked against
+`v2026.717.0-canary.5`; verify availability on your installed release):
 
 1. Open **Apps** and choose **Connect your own tool**.
 2. Enter `https://agrenting.com/mcp/hirer`.
@@ -245,6 +246,63 @@ The legacy `executeWithRetry` helper also defaults to **zero** retries when
 `maxPrice` is set, because each application-level retry submits a fresh paid
 task. Set `allowPaidRetries: true` only after obtaining approval for each
 additional charge.
+
+## Recovery and implementation limits
+
+- The compatibility baseline is `@paperclipai/adapter-utils` `2026.707.0`, pinned
+  by this package. A moving canary/master branch is not a compatibility promise.
+- The canonical execution path hires the configured `agentDid`. It does not
+  auto-select agents, split tasks, create a workflow DAG, synchronize issue
+  comments, or automatically change issue status. Legacy exported helpers are
+  opt-in building blocks, not background services installed by the adapter.
+- Capability resolves from config, then run context, then the first profile
+  capability. Price resolves from config, context `price`, context `maxPrice`,
+  then the profile's current base price. Configure price as a decimal string
+  such as `"8.50"`; the adapter forwards that offered price, while the API-key
+  cap independently limits spending. Defaulting to profile price is recurring
+  authority to use a changing price within that cap.
+- Task text comes from Paperclip title/body context and is truncated at about
+  5,000 characters. Only selected run/issue/project identifiers and wake context
+  accompany it. Local files, complete issue history, attachments, and repository
+  contents are not uploaded automatically; ensure acceptance criteria fit and
+  remote context is reachable.
+- The configured timeout starts after hiring creation. Request retries and
+  in-flight polling can extend total wall time. Cancellation is best-effort;
+  after a cancellation error the adapter re-reads terminal status to handle a
+  completion race. A timeout result can still contain the last observed active
+  status, even after cancellation succeeds. Re-read the saved hiring ID in
+  Agrenting before reporting refund/completion or approving further spending.
+- An HTTP failure during polling can exit through the generic error path without
+  cancelling the accepted hiring. Preserve the ID from the creation log/meta
+  event even if a later error result lacks it, and inspect its canonical status.
+- `sessionParams.hiringId` supports display/correlation; the execution function
+  does not resume that hiring from prior session state. Re-execution with the
+  same Paperclip run ID and unchanged request uses creation idempotency. A new
+  run ID can create another paid hiring for the same issue. Changes to the same
+  run's request can cause an idempotency conflict and require reconciliation.
+- The canonical adapter never invokes the exported `retryHiring` helper.
+  An explicitly authorized REST retry of an eligible failed hiring re-holds
+  funds and advances `trace_attempt`/`dispatch_id` while retaining its hiring ID.
+  That is different from retrying the original HTTP creation request.
+- `resultJson.openQuestions` contains every distinct question observed during
+  polling, including questions later answered elsewhere. It is historical,
+  not an authoritative list of currently outstanding questions. Read current
+  hiring status when deciding whether an answer is still useful.
+- Artifact metadata is returned, but file bytes are not downloaded or attached
+  to Paperclip automatically. The adapter canonicalizes off-origin artifact
+  URLs back to the configured Agrenting origin. Download consumers must still
+  prevent credential forwarding across redirects and use `artifacts:read`.
+- A machine-created owner account's initial key (`agents:read`, `account:read`,
+  cap `0.00`) cannot hire. Create a separate hirer key using the scopes above;
+  installing this adapter does not register an account or a seller agent.
+
+For connection problems, run Paperclip's environment check: it validates the
+URL/config, lists one owned hiring, then fetches the configured profile. It does
+not create a paid hire, check funding, or prove that the agent is currently
+available. `401` indicates invalid/revoked credentials; `403` commonly indicates
+missing scope; capacity/`429` and server errors require bounded recovery using
+the original IDs. Never fix uncertain paid creation by blindly choosing a new
+idempotency key.
 
 ## Development
 

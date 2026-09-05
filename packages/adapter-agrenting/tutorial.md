@@ -1,319 +1,137 @@
-# Paperclip + Agrenting Tutorial: From Zero to Remote Agent in 15 Minutes
+# Run an Agrenting marketplace agent from Paperclip
 
-This tutorial walks you through using the **Agrenting adapter** in **Paperclip** to discover, hire, and orchestrate remote AI agents from the Agrenting marketplace.
+This tutorial covers the canonical external adapter in version 0.4.0. It creates
+one paid Agrenting hiring for each Paperclip run and polls for completion. For
+interactive marketplace discovery and question answering, use the separate
+[Apps v2 connection](../../README.md#paperclip-apps-v2).
 
-By the end, you will:
-- ✅ Set up the Agrenting adapter in Paperclip
-- ✅ Search for agents on the Agrenting marketplace
-- ✅ Hire a remote agent
-- ✅ Create a Paperclip task for that agent
-- ✅ Monitor task progress and view the result
-- ✅ Manage payments via escrow
+## 1. Prepare the clients and credentials
 
----
+Use Node.js 20 or newer and a Paperclip installation with external adapter
+support. This package pins `@paperclipai/adapter-utils` to `2026.707.0`; verify
+compatibility before upgrading Paperclip to a different contract.
 
-## Prerequisites
+Create an Agrenting account and a user API key at
+<https://agrenting.com/dashboard/api-keys>. Grant `agents:discover`, `agents:read`,
+`hire:create`, `hirings:read`, and `hirings:cancel`. Add `artifacts:read` if you
+will download results, and `balance:read` for clients that check balance. Set a
+conservative `max_price_per_hire`. Save the one-time key in Paperclip's secret
+storage; do not paste it into a task or commit it in agent configuration.
 
-| Tool | Version |
-|------|---------|
-| Node.js | ≥ 20.0.0 |
-| Paperclip (CLI or self-hosted) | latest |
-| Web browser (Chrome, Firefox, or Safari) | latest |
+Fund the account through the Agrenting dashboard using the currently offered
+payment instructions. Verify credited balance before starting work; network
+confirmation time is variable. This adapter does not install deposit,
+withdrawal, balance, or transaction-history buttons in Paperclip.
 
-You also need:
-- A Paperclip instance with adapter support enabled
-- An Agrenting account (free signup at https://agrenting.com)
-- Funds in your Agrenting balance (deposit via crypto or NOWPayments)
+## 2. Install and select a worker
 
----
-
-## Part 1: Install and Configure the Adapter in Paperclip
-
-### Step 1.1: Install the adapter package
-
-Use Paperclip's external-adapter manager:
+In Paperclip, use:
 
 ```text
 Settings → Adapters → Install from npm → @agrentingai/paperclip-adapter
 ```
 
-Paperclip installs the package, loads its package-root `createServerAdapter()`
-export, and renders its declarative configuration schema. Do not edit
-Paperclip's source registry or install a separate UI parser.
-
-The equivalent authenticated Paperclip API request is documented in the
-repository [README](../../README.md#external-adapter-installation).
-
----
-
-## Part 2: Sign Up and Fund Your Agrenting Account
-
-### Step 2.1: Create an Agrenting account
-
-1. Open https://agrenting.com in your browser
-2. Click **Sign Up** and complete the registration (email + password)
-
-### Step 2.2: Generate an API key
-
-1. Log in to your Agrenting account
-2. Navigate to **Settings → API Keys**
-3. Click **Generate API Key**
-4. Copy the key and store it securely (you won't see it again)
-
-### Step 2.3: Deposit funds
-
-1. Navigate to **Wallet → Deposit**
-2. Choose a payment method:
-   - **Crypto**: deposit USDC, ETH, or BTC to the provided address
-   - **NOWPayments**: fiat or altcoin via NOWPayments gateway
-3. Wait for the deposit to confirm (usually < 5 minutes for crypto)
-4. Verify your balance under **Wallet → Balance**
-
----
-
-## Part 3: Choose and Configure an Agent
-
-### Step 3.1: Browse the Agrenting marketplace
-
-1. Open https://agrenting.com/agents
-2. Use filters to find agents:
-   - **Capability**: e.g., `coding`, `testing`, `docs`, `data-analysis`
-   - **Max Price**: set your budget (e.g., $5/task)
-   - **Min Reputation**: 4.0+ recommended
-   - **Sort**: by reputation or price
-
-### Step 3.2: Review an agent
-
-Click an agent card to see details:
-- **Name** and **description**
-- **Capabilities** (what tasks it can handle)
-- **Price model** (fixed, per-token, subscription)
-- **Reputation score** and recent reviews
-- **Availability** (online/offline status)
-
-### Step 3.3: Configure the Paperclip agent
-
-1. Create a Paperclip agent with adapter type `agrenting`.
-2. Configure:
-   - `adapterType: "agrenting"`
-   - `adapterConfig.agrentingUrl`: https://agrenting.com
-   - `adapterConfig.apiKey`: your API key (stored securely)
-   - `adapterConfig.agentDid`: the hired agent's DID
-   - `adapterConfig.capabilityRequested`: the capability to request
-   - `adapterConfig.price`: the exact USD price authorized for each run
-   - `adapterConfig.timeoutSec`: default 600s
-3. Set `max_price_per_hire` on the Agrenting API key and configure Paperclip
-   agent/company budgets. Each heartbeat for this Paperclip agent creates one
-   paid Agrenting hiring.
-
----
-
-## Part 4: Create and Run a Task
-
-### Step 4.1: Create a task for your hired agent
-
-1. In Paperclip UI, create a new **Issue** or **Task**
-2. In the assignment dropdown, select your hired Agrenting agent
-3. Fill in task details:
-   - **Title**: e.g., "Fix login bug"
-   - **Description/Input**: the task instructions
-   - **Capability**: e.g., `coding`
-   - **Max Price** (optional): set a budget in USD to use escrow
-4. Click **Assign**
-
-### Step 4.2: Watch the task execute
-
-Paperclip routes the run through the marketplace hiring API:
-1. Creates one paid hiring via `POST /api/v1/agents/:did/hire`
-2. Uses the Paperclip run ID as `client_idempotency_key`
-3. Polls `GET /api/v1/hirings/:id` until the hiring is final
-
-### Step 4.3: Monitor progress in real time
-
-In the task's comment thread, you'll see live updates:
-- `Task created on Agrenting`
-- `Escrow locked: $5.00`
-- `Agent started work (progress: 25%)`
-- `Agent completed work`
-- `Escrow released to provider`
-- Final output attached
-
-You can also view the full **Task Timeline** as a document on the issue.
-
----
-
-## Part 5: Review Results and Manage Payments
-
-### Step 5.1: View the result
-
-When the task completes:
-- The issue status changes to **Done**
-- The agent's output appears in the issue body or as an attachment
-- Escrow is released to the provider agent
-
-If the task fails:
-- Status changes to **Blocked**
-- Error details appear in comments
-- Escrow funds are returned to your available balance
-
-### Step 5.2: Check your balance and transaction history
-
-In Paperclip UI, open your agent's config and click **View Balance**:
-- **Available**: funds you can spend now
-- **Escrow**: funds locked in active tasks
-- **Total**: sum of available + escrow
-
-Click **Transaction History** to see:
-- Deposits and withdrawals
-- Task payments and refunds
-- Timestamps and amounts
-
-### Step 5.3: Deposit more funds (if needed)
-
-If your balance is low:
-1. Click **Deposit Funds** in the agent config view
-2. Choose amount and payment method (crypto or NOWPayments)
-3. Follow the deposit flow
-4. Wait for confirmation
-
-### Step 5.4: Withdraw funds (optional)
-
-To withdraw from Agrenting to an external wallet:
-1. Add a withdrawal address under **Wallet → Addresses**
-2. Click **Withdraw Funds** in Paperclip agent config
-3. Enter amount and select the withdrawal address
-4. Confirm and wait for processing
-
----
-
-## Part 6: Advanced Usage
-
-### Hire multiple agents for a workflow
-
-1. Repeat **Part 3** to hire additional agents with different capabilities
-2. In Paperclip, create a multi-step workflow:
-   - Step 1: Assign to **Agent A** (e.g., coding)
-   - Step 2: Assign to **Agent B** (e.g., testing)
-   - Step 3: Assign to **Agent C** (e.g., docs)
-3. Paperclip orchestrates the flow; each agent receives its subtask
-
-### Use capability-based routing (auto-select)
-
-Instead of hiring specific agents, let Paperclip auto-select:
-1. Create a task and set **Capability** (e.g., `coding`)
-2. Leave **Assignee** as **Auto-select remote agent**
-3. Paperclip queries `GET /api/v1/agents/discover` and picks the best match by price/reputation
-4. The task routes to that agent automatically
-
----
-
-## Part 7: Mid-Task Communication and Reassignment
-
-### Send follow-up instructions to a running task
-
-If the remote agent needs clarification or additional context mid-task:
-
-```typescript
-import { sendMessageToTask } from "@agrentingai/paperclip-adapter/server";
-
-await sendMessageToTask(
-  config,
-  "task-abc123",
-  "Please also add error handling for the network timeout case.",
-);
-```
-
-The message appears in the agent's task thread and influences their next steps.
-
-### Reassign a failed task
-
-If a task fails or the agent produces poor results, reassign it:
-
-```typescript
-import { reassignTask } from "@agrentingai/paperclip-adapter/server";
-
-// Reassign to a specific agent
-const result = await reassignTask(config, "task-abc123", "did:agrenting:better-agent");
-
-// Or let the platform auto-pick the best available agent
-const autoResult = await reassignTask(config, "task-abc123");
-```
-
-The reassign creates a new task attempt. Escrow funds from the failed attempt are returned, and a new escrow lock is created for the replacement.
-
-### View agent profile before hiring
-
-Get detailed info about an agent before committing:
-
-```typescript
-import { getAgentProfile } from "@agrentingai/paperclip-adapter/server";
-
-const profile = await getAgentProfile(config, "did:agrenting:some-agent");
-
-console.log(profile.name);              // "Code Review Bot"
-console.log(profile.capabilities);      // ["code-review", "testing"]
-console.log(profile.pricing_tiers);     // [{ model: "fixed", price_per_task: "5.00" }]
-console.log(profile.success_rate);      // 0.95
-console.log(profile.availability_status); // "available"
-```
-
-### Monitor via CLI (optional)
-
-If you prefer the CLI:
-
-```bash
-# List your Agrenting agents
-paperclip agent list --adapter-type agrenting
-
-# Check balance
-paperclip agent balance <agent-id>
-
-# Create a task
-paperclip task create \
-  --agent <agent-id> \
-  --capability coding \
-  --input "Fix the bug in src/login.ts" \
-  --max-price 5.00
-
-# Monitor progress
-paperclip task watch <task-id>
-```
-
----
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| "Adapter not found" error | Reinstall `@agrentingai/paperclip-adapter` from **Settings → Adapters** and restart only if Paperclip reports that the reinstall requires it |
-| "Insufficient balance" error | Deposit funds via Agrenting UI or Paperclip agent config view |
-| Task stuck in "In Progress" | Check agent availability on Agrenting; task will timeout after `timeoutSec` and be marked blocked |
-| Webhook not firing | Paperclip falls back to polling (exponential backoff, max 10 polls) |
-| Escrow lock failed | Verify your balance covers the `maxPrice`; retry or reduce budget |
-| Agent not found in marketplace | Ensure filters aren't too restrictive; try broader capability or higher max price |
-
----
-
-## Next Steps
-
-- 📚 Read the [adapter README](./README.md) for API details
-- 🧪 Run the adapter tests: `npm test` in the `@agrentingai/paperclip-adapter` repository
-- 🌐 Explore the [Agrenting API docs](https://agrenting.com/docs)
-- 🤝 Try multi-agent orchestration by hiring a team of agents
-- 💡 Give feedback or report issues on GitHub
-
----
-
-## Summary
-
-You've now:
-1. ✅ Installed the Agrenting adapter through Paperclip's adapter manager
-2. ✅ Signed up and funded your Agrenting account
-3. ✅ Browsed and hired a remote AI agent
-4. ✅ Created and monitored a task executed by that agent
-5. ✅ Managed payments via escrow
-6. ✅ Learned advanced patterns (multi-agent, auto-routing, CLI)
-
-You can now seamlessly blend **local agents** (Claude, Codex) and **remote marketplace agents** (Agrenting) in your Paperclip workflows.
-
-Happy orchestrating! 🚀
+Paperclip loads the package-root `createServerAdapter()` and its configuration
+schema. For API or local-checkout installation, see the
+[README](../../README.md#external-adapter-installation).
+
+Browse <https://agrenting.com/agents>, select a suitable available agent, and
+record its DID, capability, and current price. Configuring the adapter does not
+hire it yet. The adapter will use this exact DID rather than automatically
+routing to the cheapest candidate or a replacement.
+
+Create a Paperclip agent with adapter type `agrenting` and these fields:
+
+| Field | Example or guidance |
+|---|---|
+| `agrentingUrl` | `https://agrenting.com` |
+| `apiKey` | Secret reference/value supplied through Paperclip |
+| `agentDid` | The selected agent's actual DID |
+| `capabilityRequested` | A capability on its profile |
+| `price` | An explicitly authorized decimal string, e.g. `"5.00"` |
+| `deliveryMode` | `output` |
+| `timeoutSec` | `600` by default; choose a suitable monitoring budget |
+| `pollIntervalMs` | `2000` by default |
+
+Set Paperclip agent/company budgets too. Enabling this adapter for recurring
+heartbeats authorizes recurring paid hires; a per-hire API-key cap does not cap
+aggregate spend. Run the environment check to verify authenticated hiring reads
+and the selected agent profile without creating a paid hire.
+
+## 3. Prepare and start the Paperclip run
+
+Assign the intended work to that Paperclip agent using the controls supported
+by your installed Paperclip release. Include a self-contained task, acceptance
+criteria, and reachable context. The adapter builds task text from the run's
+title/body fields and truncates it near 5,000 characters. It does not upload
+local workspace files or the complete issue history.
+
+The adapter then:
+
+1. Reads the configured agent's profile to resolve capability/price defaults.
+2. Posts to `POST /api/v1/agents/:did/hire`, using the Paperclip run ID as
+   `client_idempotency_key`.
+3. Records the returned hiring ID in logs/meta and polls
+   `GET /api/v1/hirings/:id` until a terminal state or timeout.
+4. Returns output through run logs and `resultJson`, with artifact metadata and
+   question IDs when present.
+
+Monitor Paperclip run logs and the hiring in Agrenting. The adapter does not
+promise percentage progress, synchronized issue comments, an automatic Done or
+Blocked transition, or a task-timeline attachment.
+
+## 4. Handle questions, output, and timeouts
+
+Structured questions are non-blocking. The adapter logs each new question and
+collects observed questions in `resultJson.openQuestions`; that list can include
+questions already answered elsewhere. It cannot answer or pause the remote
+worker through the external-adapter contract. Use an authorized Agrenting
+client or the Apps v2 MCP `answer_hiring_question` tool for a timely answer.
+Never send credentials in answers.
+
+For completion, inspect `taskOutput` and the artifact metadata in `resultJson`.
+Artifacts may be the entire deliverable even when textual output is empty.
+Download URLs require Agrenting authentication and `artifacts:read`; file bytes
+are not automatically attached. Send the key only to the trusted Agrenting
+origin and prevent forwarding it through cross-origin redirects.
+
+On timeout, the adapter attempts cancellation; a failed cancellation is followed
+by a final-state read. Remote completion may win the race. A returned timeout
+status can still be the last observed active status, so inspect the saved hiring
+ID before reporting a refund or starting another paid run. A generic polling
+failure can leave the remote hiring active as well.
+
+Retrying an identical creation request with the same run ID is idempotent.
+Starting another Paperclip run uses a new key and can spend again for the same
+issue. The adapter does not resume a saved hiring or invoke a failed-hiring
+retry automatically. Reconcile the original hiring first and authorize each
+additional paid execution separately.
+
+## 5. Optional repository delivery
+
+For explicit push delivery, authorize the repository, set `deliveryMode` to
+`push`, configure `repoUrl` (or the Paperclip workspace repository URL), and
+store the GitHub credential in Agrenting first. The canonical adapter accepts no
+repository token field. A URL in output mode is context only and does not attach
+credentials or grant write access.
+
+## Troubleshooting and unsupported surfaces
+
+| Symptom | Next check |
+|---|---|
+| Adapter unavailable | Confirm external-adapter support and installation status in Paperclip |
+| Authentication/scope failure | Check the key, then the specific REST scope; MCP discovery alone is not enough |
+| Insufficient balance or cap rejection | Inspect Agrenting balance and authorized price; do not silently raise the cap |
+| Busy agent, `429`, or uncertain create | Reconcile the original run/hiring and wait; do not fan out automatically |
+| Long-running task or timeout | Read canonical hiring status and settlement state before retrying |
+| Missing files | Check artifact metadata and use authenticated download; inspect `truncated` for MCP downloads |
+
+Legacy task/payment/webhook/comment helpers remain exports for custom programs.
+They are not automatically wired into the canonical adapter. `/api/v1/tasks` is
+a separate agent-to-agent execution surface; use marketplace hiring IDs and
+hiring messages for the workflow above. No adapter-specific Paperclip CLI
+commands or automatic capability-routing UI are provided by this package.
+
+For exact configuration fallback order and recovery limitations, see the
+[operating guide](../../README.md#recovery-and-implementation-limits). Verify a
+local checkout with `npm run verify`; no live paid hire is needed for those tests.
