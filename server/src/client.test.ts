@@ -70,6 +70,53 @@ describe("AgrentingClient", () => {
   // -------------------------------------------------------------------------
 
   describe("createTask", () => {
+    it("rejects a malformed task response without an id", async () => {
+      const client = new AgrentingClient(mockConfig);
+      mockFetchResponse(202, { data: { status: "queued" } });
+
+      await expect(
+        client.createTask({
+          providerAgentId: "provider-agent-id",
+          capability: "code-review",
+          input: "review",
+        })
+      ).rejects.toThrow("without a task id");
+    });
+
+    it("normalizes the current async task and inline payment response", async () => {
+      const client = new AgrentingClient(mockConfig);
+      mockFetchResponse(202, {
+        data: {
+          task_id: "task-current",
+          status: "queued",
+          execution_mode: "async",
+          payment_status: "paid",
+          payment: {
+            payment_id: "pay-current",
+            status: "escrowed",
+            payment_type: "balance",
+            amount: "12.00",
+          },
+        },
+      });
+
+      const task = await client.createTask({
+        providerAgentId: "provider-agent-id",
+        capability: "code-review",
+        input: "review this code",
+        maxPrice: "12.00",
+      });
+
+      expect(task.id).toBe("task-current");
+      expect(task.payment).toMatchObject({
+        id: "pay-current",
+        payment_id: "pay-current",
+        task_id: "task-current",
+        currency: "USD",
+        amount: "12.00",
+      });
+    });
+
     it("sends POST to /api/v1/tasks with correct body", async () => {
       const client = new AgrentingClient(mockConfig);
       const taskData = {
@@ -78,7 +125,7 @@ describe("AgrentingClient", () => {
         client_agent_id: "client-1",
         provider_agent_id: "did:agrenting:test-agent",
         capability: "code-review",
-        input: "review this code",
+        input: { prompt: "review this code" },
         created_at: "2025-01-01T00:00:00Z",
         updated_at: "2025-01-01T00:00:00Z",
       };
@@ -100,7 +147,7 @@ describe("AgrentingClient", () => {
       const call = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
       const body = JSON.parse(call[1].body);
       expect(body.provider_agent_id).toBe("did:agrenting:test-agent");
-      expect(body.input).toBe("review this code");
+      expect(body.input).toEqual({ prompt: "review this code" });
     });
 
     it("includes max_price when provided", async () => {
@@ -117,6 +164,22 @@ describe("AgrentingClient", () => {
       const call = (fetch as ReturnType<typeof vi.fn>).mock.calls[0];
       const body = JSON.parse(call[1].body);
       expect(body.max_price).toBe("50.00");
+    });
+
+    it("attaches a stable idempotency key when provided", async () => {
+      const client = new AgrentingClient(mockConfig);
+      const fn = mockFetchResponse(200, { data: { id: "task-keyed" } });
+
+      await client.createTask({
+        providerAgentId: "did:agrenting:test-agent",
+        capability: "code-review",
+        input: "review",
+        idempotencyKey: "paperclip-task-1",
+      });
+
+      expect(fn.mock.calls[0][1].headers["X-Idempotency-Key"]).toBe(
+        "paperclip-task-1",
+      );
     });
   });
 
@@ -296,6 +359,31 @@ describe("AgrentingClient", () => {
   // -------------------------------------------------------------------------
 
   describe("createTaskPayment", () => {
+    it("normalizes the current create-payment response", async () => {
+      const client = new AgrentingClient(mockConfig);
+      mockFetchResponse(200, {
+        data: {
+          payment_id: "pay-current",
+          task_id: "t1",
+          amount: "25.00",
+          status: "escrowed",
+          payment_type: "balance",
+          invoice_url: null,
+        },
+      });
+
+      const result = await client.createTaskPayment("t1");
+
+      expect(result).toMatchObject({
+        id: "pay-current",
+        payment_id: "pay-current",
+        task_id: "t1",
+        amount: "25.00",
+        currency: "USD",
+        status: "escrowed",
+      });
+    });
+
     it("creates payment for a task", async () => {
       const client = new AgrentingClient(mockConfig);
       const paymentData = {
@@ -312,11 +400,69 @@ describe("AgrentingClient", () => {
         paymentType: "escrow",
       });
 
-      expect(result).toEqual(paymentData);
+      expect(result).toMatchObject(paymentData);
       expect(fetch).toHaveBeenCalledWith(
         "https://api.agrenting.com/api/v1/tasks/t1/payments",
         expect.objectContaining({ method: "POST" })
       );
+    });
+
+    it("does not replay an ambiguous payment POST and reconciles by GET", async () => {
+      const client = new AgrentingClient(mockConfig);
+      const paymentData = {
+        id: "pay-existing",
+        task_id: "t1",
+        amount: "25.00",
+        currency: "USD",
+        status: "escrowed",
+        created_at: "2025-01-01T00:00:00Z",
+      };
+      const fn = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 500,
+          headers: new Headers(),
+          text: async () => "upstream timed out after charging",
+          json: async () => ({}),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          text: async () => JSON.stringify({ data: paymentData }),
+          json: async () => ({ data: paymentData }),
+        });
+      vi.stubGlobal("fetch", fn);
+
+      await expect(client.createTaskPayment("t1")).resolves.toMatchObject(paymentData);
+      expect(fn).toHaveBeenCalledTimes(2);
+      expect(fn.mock.calls[0][1]).toEqual(expect.objectContaining({ method: "POST" }));
+      expect(fn.mock.calls[1][1]).toEqual(expect.objectContaining({ method: "GET" }));
+    });
+
+    it("does not retry a failed payment when reconciliation finds nothing", async () => {
+      const client = new AgrentingClient(mockConfig);
+      const fn = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 503,
+          headers: new Headers(),
+          text: async () => "temporarily unavailable",
+          json: async () => ({}),
+        })
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 404,
+          headers: new Headers(),
+          text: async () => "PAYMENT_NOT_FOUND",
+          json: async () => ({}),
+        });
+      vi.stubGlobal("fetch", fn);
+
+      await expect(client.createTaskPayment("t1")).rejects.toThrow("503");
+      expect(fn).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -511,6 +657,14 @@ describe("AgrentingClient", () => {
   // -------------------------------------------------------------------------
 
   describe("retry logic", () => {
+    it("does not replay an unsafe POST without an idempotency key", async () => {
+      const client = new AgrentingClient(mockConfig);
+      const fn = mockFetchResponse(503, "temporarily unavailable");
+
+      await expect(client.cancelTask("task-unsafe")).rejects.toThrow("503");
+      expect(fn).toHaveBeenCalledTimes(1);
+    });
+
     it("does not retry non-retryable 4xx responses", async () => {
       const client = new AgrentingClient(mockConfig);
       const fn = mockFetchResponse(422, "Invalid hiring payload");
@@ -715,6 +869,7 @@ describe("AgrentingClient", () => {
         task_input: { issue_id: "issue-1" },
         client_message: "Start with the failing test.",
       });
+      expect(call[1].headers["X-Idempotency-Key"]).toBe("paperclip-run-123");
     });
   });
 
@@ -759,26 +914,34 @@ describe("AgrentingClient", () => {
     it("sends a message to a running task", async () => {
       const client = new AgrentingClient(mockConfig);
       mockFetchResponse(200, {
-        data: { message_id: "msg-1", task_id: "task-42", sent_at: "2026-04-13T10:00:00Z" },
+        data: {
+          id: "msg-1",
+          content: "Please add error handling",
+          sender_type: "client",
+          inserted_at: "2026-04-13T10:00:00Z",
+        },
       });
 
       const result = await client.sendMessageToTask("task-42", { message: "Please add error handling" });
 
       expect(result.message_id).toBe("msg-1");
       expect(result.task_id).toBe("task-42");
-    });
-
-    it("sends message type in request body", async () => {
-      const client = new AgrentingClient(mockConfig);
-      mockFetchResponse(200, {
-        data: { message_id: "msg-2", task_id: "task-42", sent_at: "2026-04-13T10:00:00Z" },
-      });
-
-      await client.sendMessageToTask("task-42", { message: "Good job!", messageType: "feedback" });
-
       const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
       const body = JSON.parse(call[1].body);
-      expect(body.message_type).toBe("feedback");
+      expect(body).toEqual({ content: "Please add error handling" });
+    });
+  });
+
+  describe("getTaskMessages", () => {
+    it("fails locally because the current API has no task message-history route", async () => {
+      const client = new AgrentingClient(mockConfig);
+      const fn = vi.fn();
+      vi.stubGlobal("fetch", fn);
+
+      await expect(client.getTaskMessages("task-42")).rejects.toThrow(
+        "does not expose task message history"
+      );
+      expect(fn).not.toHaveBeenCalled();
     });
   });
 
@@ -789,40 +952,62 @@ describe("AgrentingClient", () => {
   describe("reassignTask", () => {
     it("reassigns a task to a new agent", async () => {
       const client = new AgrentingClient(mockConfig);
-      mockFetchResponse(200, {
-        data: {
-          task_id: "task-99",
-          previous_agent_did: "did:agrenting:old",
-          new_agent_did: "did:agrenting:new",
-          reassigned_at: "2026-04-13T10:00:00Z",
-        },
-      });
+      const fn = vi
+        .fn()
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            data: {
+              id: "agent-new",
+              did: "did:agrenting:new",
+              name: "New agent",
+              capabilities: ["code-review"],
+            },
+          }),
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            data: {
+              id: "task-99",
+              provider_agent_id: "agent-new",
+              status: "pending",
+            },
+          }),
+        });
+      vi.stubGlobal("fetch", fn);
 
       const result = await client.reassignTask("task-99", "did:agrenting:new");
 
       expect(result.task_id).toBe("task-99");
-      expect(result.previous_agent_did).toBe("did:agrenting:old");
       expect(result.new_agent_did).toBe("did:agrenting:new");
+      expect(result.new_provider_agent_id).toBe("agent-new");
+      const body = JSON.parse(fn.mock.calls[1][1].body);
+      expect(body).toEqual({ provider_agent_id: "agent-new" });
     });
 
     it("reassigns without specifying agent (platform picks best)", async () => {
       const client = new AgrentingClient(mockConfig);
       mockFetchResponse(200, {
         data: {
-          task_id: "task-100",
-          previous_agent_did: "did:agrenting:old",
-          new_agent_did: "did:agrenting:auto-picked",
-          reassigned_at: "2026-04-13T10:00:00Z",
+          id: "task-100",
+          provider_agent_id: "agent-auto-picked",
+          status: "pending",
         },
       });
 
       const result = await client.reassignTask("task-100");
 
-      expect(result.new_agent_did).toBe("did:agrenting:auto-picked");
+      expect(result.new_provider_agent_id).toBe("agent-auto-picked");
+      expect(result.status).toBe("pending");
       // Verify empty body was sent
       const call = (fetch as ReturnType<typeof vi.fn>).mock.calls.at(-1)!;
       const body = JSON.parse(call[1].body);
-      expect(body.new_agent_did).toBeUndefined();
+      expect(body.provider_agent_id).toBeUndefined();
     });
   });
 

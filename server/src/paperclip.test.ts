@@ -161,12 +161,216 @@ describe("canonical Paperclip adapter", () => {
     );
   });
 
+  it("keeps delivered artifact metadata and authenticated download URLs in the completed result", async () => {
+    clientMocks.hireAgent.mockResolvedValue({
+      hiring: {
+        id: "hiring-artifacts",
+        status: "completed",
+        price: "7.50",
+        task_output: {},
+        artifacts: [
+          {
+            id: "artifact-1",
+            name: "review.md",
+            artifact_type: "file",
+            content_type: "text/markdown",
+            size_bytes: 42,
+          },
+        ],
+      },
+      config: {
+        agentDid: profile.did,
+        pricingModel: "fixed",
+        basePrice: "7.50",
+        capabilities: ["code-review"],
+        hiringId: "hiring-artifacts",
+      },
+    });
+    const ctx = executionContext();
+
+    const result = await executePaperclip(ctx);
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      summary: "Agrenting hiring hiring-artifacts completed with 1 artifact: review.md.",
+      resultJson: {
+        hiringId: "hiring-artifacts",
+        status: "completed",
+        taskOutput: {},
+        artifacts: [
+          {
+            id: "artifact-1",
+            name: "review.md",
+            artifact_type: "file",
+            content_type: "text/markdown",
+            size_bytes: 42,
+            download_url:
+              "https://agrenting.com/api/v1/artifacts/artifact-1/download",
+          },
+        ],
+      },
+    });
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stdout",
+      "Agrenting hiring hiring-artifacts completed with 1 artifact: review.md.\n"
+    );
+  });
+
+  it("falls back to the canonical authenticated URL for malformed artifact metadata", async () => {
+    clientMocks.hireAgent.mockResolvedValue({
+      hiring: {
+        id: "hiring-malformed-artifact",
+        status: "completed",
+        price: "7.50",
+        task_output: { result: "Delivered" },
+        artifacts: [
+          {
+            id: "artifact-safe",
+            name: "result.txt",
+            download_url: "http://[malformed",
+          },
+        ],
+      },
+      config: {
+        agentDid: profile.did,
+        pricingModel: "fixed",
+        basePrice: "7.50",
+        capabilities: ["code-review"],
+        hiringId: "hiring-malformed-artifact",
+      },
+    });
+
+    const result = await executePaperclip(executionContext());
+
+    expect(result).toMatchObject({
+      exitCode: 0,
+      resultJson: {
+        artifacts: [
+          {
+            id: "artifact-safe",
+            download_url:
+              "https://agrenting.com/api/v1/artifacts/artifact-safe/download",
+          },
+        ],
+      },
+    });
+  });
+
+  it("reconciles a completion that wins the timeout cancellation race", async () => {
+    clientMocks.hireAgent.mockResolvedValue({
+      hiring: { id: "hiring-race", status: "in_progress", price: "7.50" },
+      config: {
+        agentDid: profile.did,
+        pricingModel: "fixed",
+        basePrice: "7.50",
+        capabilities: ["code-review"],
+        hiringId: "hiring-race",
+      },
+    });
+    clientMocks.cancelHiring.mockRejectedValue(
+      new Error("Agrenting API 409: hiring is already terminal")
+    );
+    clientMocks.getHiring.mockResolvedValue({
+      id: "hiring-race",
+      status: "completed",
+      price: "7.50",
+      task_output: { result: "Finished at the deadline" },
+      artifacts: [],
+    });
+    let clock = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      clock += 1_000;
+      return clock;
+    });
+
+    const result = await executePaperclip(
+      executionContext({ timeoutSec: 1, pollIntervalMs: 1 })
+    );
+
+    nowSpy.mockRestore();
+    expect(result).toMatchObject({
+      exitCode: 0,
+      timedOut: false,
+      summary: "Finished at the deadline",
+      sessionParams: { hiringId: "hiring-race" },
+    });
+    expect(clientMocks.getHiring).toHaveBeenCalledWith("hiring-race");
+  });
+
+  it("logs each structured open question once and retains it in the final result", async () => {
+    clientMocks.hireAgent.mockResolvedValue({
+      hiring: { id: "hiring-question", status: "in_progress", price: "7.50" },
+      config: {
+        agentDid: profile.did,
+        pricingModel: "fixed",
+        basePrice: "7.50",
+        capabilities: ["code-review"],
+        hiringId: "hiring-question",
+      },
+    });
+    clientMocks.getHiring
+      .mockResolvedValueOnce({
+        id: "hiring-question",
+        status: "in_progress",
+        price: "7.50",
+        open_questions: [
+          {
+            question_id: "question-1",
+            content: "Should I include generated files?",
+            asked_at: "2026-09-05T08:00:00Z",
+          },
+        ],
+      })
+      .mockResolvedValueOnce({
+        id: "hiring-question",
+        status: "completed",
+        price: "7.50",
+        task_output: { result: "Review complete" },
+        artifacts: [],
+        open_questions: [
+          {
+            question_id: "question-1",
+            content: "Should I include generated files?",
+            asked_at: "2026-09-05T08:00:00Z",
+          },
+        ],
+      });
+    const ctx = executionContext({ pollIntervalMs: 1 });
+
+    const result = await executePaperclip(ctx);
+
+    const questionLogs = vi.mocked(ctx.onLog).mock.calls.filter(
+      ([stream, chunk]) =>
+        stream === "stderr" &&
+        chunk ===
+          "[agrenting] Open question question-1: Should I include generated files?\n"
+    );
+    expect(questionLogs).toHaveLength(1);
+    expect(result.resultJson).toMatchObject({
+      openQuestions: [
+        {
+          question_id: "question-1",
+          content: "Should I include generated files?",
+          asked_at: "2026-09-05T08:00:00Z",
+        },
+      ],
+    });
+  });
+
   it("returns a structured failure for a terminal failed hiring", async () => {
     clientMocks.hireAgent.mockResolvedValue({
       hiring: {
         id: "hiring-failed",
         status: "failed",
         failed_reason: "Remote tests failed",
+        artifacts: [{ id: "artifact-partial", name: "partial.log" }],
+        open_questions: [
+          {
+            question_id: "question-failed",
+            content: "Can you clarify the failure?",
+            asked_at: "2026-09-05T08:30:00Z",
+          },
+        ],
       },
       config: {
         agentDid: profile.did,
@@ -185,6 +389,23 @@ describe("canonical Paperclip adapter", () => {
       errorCode: "agrenting_hiring_failed",
       errorMessage: "Remote tests failed",
       sessionParams: { hiringId: "hiring-failed" },
+      resultJson: {
+        artifacts: [
+          {
+            id: "artifact-partial",
+            name: "partial.log",
+            download_url:
+              "https://agrenting.com/api/v1/artifacts/artifact-partial/download",
+          },
+        ],
+        openQuestions: [
+          {
+            question_id: "question-failed",
+            content: "Can you clarify the failure?",
+            asked_at: "2026-09-05T08:30:00Z",
+          },
+        ],
+      },
     });
     expect(clientMocks.getHiring).not.toHaveBeenCalled();
   });

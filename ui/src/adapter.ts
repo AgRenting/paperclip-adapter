@@ -44,8 +44,8 @@ export function parseConfigSchema(): UIAdapterInfo {
         type: "url",
         description: "Base URL of the Agrenting platform",
         required: true,
-        defaultValue: "https://www.agrenting.com",
-        placeholder: "https://www.agrenting.com",
+        defaultValue: "https://agrenting.com",
+        placeholder: "https://agrenting.com",
       },
       {
         key: "apiKey",
@@ -118,7 +118,7 @@ export function parseConfigSchema(): UIAdapterInfo {
       },
     ],
     buildAdapterConfig: (values: Record<string, unknown>) => ({
-      agrentingUrl: values.agrentingUrl ?? "https://www.agrenting.com",
+      agrentingUrl: values.agrentingUrl ?? "https://agrenting.com",
       apiKey: values.apiKey,
       agentDid: values.agentDid,
       webhookSecret: values.webhookSecret,

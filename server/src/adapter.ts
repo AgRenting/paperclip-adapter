@@ -13,7 +13,6 @@ import type {
   SendMessageResult,
   TransactionInfo,
   DiscoverAgentsOptions,
-  CreateTaskPaymentOptions,
   Hiring,
   TaskMessage,
   HiringMessage,
@@ -77,8 +76,8 @@ export function getConfigSchema(): Record<string, unknown> {
       agrentingUrl: {
         type: "string",
         format: "uri",
-        description: "Agrenting platform URL (e.g. https://www.agrenting.com)",
-        default: "https://www.agrenting.com",
+        description: "Agrenting platform URL (e.g. https://agrenting.com)",
+        default: "https://agrenting.com",
       },
       apiKey: {
         type: "string",
@@ -388,6 +387,8 @@ export async function execute(
   const client = new AgrentingClient(config);
   const startTime = Date.now();
 
+  const provider = await client.getAgentProfile(config.agentDid);
+
   // Upload instructions if managed mode is configured
   if (
     config.instructionsBundleMode === "managed" &&
@@ -409,7 +410,7 @@ export async function execute(
 
   // Submit the task to Agrenting
   const task = await client.createTask({
-    providerAgentId: config.agentDid,
+    providerAgentId: provider.id,
     capability: params.capability,
     input: params.input,
     maxPrice: params.maxPrice,
@@ -418,29 +419,11 @@ export async function execute(
 
   const taskId = task.id;
 
-  // Lock escrow funds if a max price was specified.
-  // If payment fails, cancel the orphaned task to avoid leaving it stuck on the server.
-  let payment: PaymentInfo | undefined;
-  if (params.maxPrice) {
-    try {
-      const paymentOptions: CreateTaskPaymentOptions = {};
-      if (params.paymentType) paymentOptions.paymentType = params.paymentType;
-      payment = await client.createTaskPayment(taskId, paymentOptions);
-      console.log(`[adapter-agrenting] Escrow locked for task ${taskId}: ${payment.amount} ${payment.currency} (${payment.status})`);
-    } catch (err) {
-      console.error(`[adapter-agrenting] Failed to lock escrow for task ${taskId}, cancelling orphaned task:`, err);
-      try {
-        await client.cancelTask(taskId);
-      } catch {
-        // Best-effort cleanup — log but don't throw, the payment error is the real problem
-      }
-      return {
-        success: false,
-        error: `Escrow payment failed: ${err instanceof Error ? err.message : String(err)}`,
-        taskId,
-        durationMs: Date.now() - startTime,
-      };
-    }
+  // Current Agrenting creates and holds billable-task escrow atomically with
+  // task creation. Replaying a second payment request would return ALREADY_PAID.
+  const payment = task.payment;
+  if (payment) {
+    console.log(`[adapter-agrenting] Escrow locked for task ${taskId}: ${payment.amount} ${payment.currency} (${payment.status})`);
   }
 
   // Register for webhook callbacks only when webhook mode is actually configured.
@@ -934,8 +917,10 @@ export async function autoSelectAgent(
 
 /**
  * Execute a task with retry logic.
- * If the task fails, it will be retried up to TASK_MAX_RETRIES times
- * with exponential backoff.
+ *
+ * Paid task execution is not retried by default: each retry creates a new task
+ * and can place another escrow hold. Callers that have separately approved
+ * each additional charge may opt in with `allowPaidRetries`.
  */
 export async function executeWithRetry(
   config: AgrentingAdapterConfig,
@@ -946,9 +931,14 @@ export async function executeWithRetry(
     maxPrice?: string;
     paymentType?: string;
     maxRetries?: number;
+    /** Explicitly approve additional paid task submissions on failure. */
+    allowPaidRetries?: boolean;
   }
 ): Promise<AgrentingExecutionResult> {
-  const maxRetries = params.maxRetries ?? TASK_MAX_RETRIES;
+  const maxRetries =
+    params.maxPrice && !params.allowPaidRetries
+      ? 0
+      : params.maxRetries ?? TASK_MAX_RETRIES;
   let lastResult: AgrentingExecutionResult | undefined;
   let lastError: Error | null = null;
 

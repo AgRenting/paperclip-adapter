@@ -3,7 +3,7 @@
  * These fields are rendered in the Paperclip UI when configuring an Agrenting agent.
  */
 export interface AgrentingAdapterConfig {
-  /** Agrenting platform URL, e.g. https://www.agrenting.com */
+  /** Agrenting platform URL, e.g. https://agrenting.com */
   agrentingUrl: string;
   /** API key for Agrenting authentication */
   apiKey: string;
@@ -55,7 +55,7 @@ export interface AgrentingTask {
   client_agent_id: string;
   provider_agent_id: string;
   capability: string;
-  input: string;
+  input: Record<string, unknown> | string;
   output?: string;
   error_reason?: string;
   progress_percent?: number;
@@ -63,6 +63,7 @@ export interface AgrentingTask {
   created_at: string;
   updated_at: string;
   completed_at?: string;
+  payment?: PaymentInfo;
 }
 
 /** Marketplace agent info returned by discover endpoint */
@@ -92,12 +93,15 @@ export interface BalanceInfo {
 /** Payment info for a task — escrow lock and transaction details */
 export interface PaymentInfo {
   id: string;
+  payment_id?: string;
   task_id: string;
   amount: string;
   currency: string;
   status: string;
   payment_type?: string;
-  created_at: string;
+  created_at?: string;
+  invoice_url?: string | null;
+  escrow_held?: boolean;
   transaction_hash?: string;
 }
 
@@ -205,6 +209,8 @@ export interface Hiring {
   id: string;
   status: HiringStatus;
   final?: boolean;
+  dispatch_id?: string | null;
+  trace_attempt?: number;
   agent_id?: string;
   agent_did?: string;
   client_agent_id?: string;
@@ -228,7 +234,8 @@ export interface Hiring {
   failed_reason?: string | null;
   repo_url?: string | null;
   messages?: HiringMessage[];
-  artifacts?: Array<Record<string, unknown>>;
+  open_questions?: HiringQuestion[];
+  artifacts?: HiringArtifact[];
   started_at?: string | null;
   completed_at?: string | null;
   failed_at?: string | null;
@@ -274,8 +281,8 @@ export interface TaskMessage {
 /** Result of reassigning a task to a different agent */
 export interface ReassignTaskResult {
   task_id: string;
-  previous_agent_did: string;
-  new_agent_did: string;
+  previous_agent_did?: string;
+  new_agent_did?: string;
   new_provider_agent_id?: string;
   status?: string;
   reassigned_at?: string;
@@ -287,10 +294,30 @@ export interface HiringMessage {
   hiring_id?: string;
   sender_agent_id?: string;
   sender_type?: string;
+  kind?: "message" | "question" | "answer" | string;
+  reply_to_id?: string | null;
+  resolved_at?: string | null;
   content: string;
   created_at?: string;
   inserted_at?: string;
   sender_name?: string;
+}
+
+/** Structured, non-blocking agent question exposed by hiring status reads. */
+export interface HiringQuestion {
+  question_id: string;
+  content: string;
+  asked_at?: string | null;
+}
+
+/** Artifact metadata embedded in a hiring detail response. */
+export interface HiringArtifact extends Record<string, unknown> {
+  id: string;
+  name?: string | null;
+  artifact_type?: string | null;
+  content_type?: string | null;
+  size_bytes?: number | null;
+  download_url?: string;
 }
 
 /** Capability returned by GET /api/v1/capabilities */

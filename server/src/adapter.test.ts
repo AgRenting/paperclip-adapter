@@ -20,6 +20,12 @@ vi.mock("./client.js", () => {
     AgrentingClient: vi.fn().mockImplementation(function() {
       return {
         testConnection: vi.fn().mockResolvedValue({ ok: true, message: "Connected" }),
+        getAgentProfile: vi.fn().mockResolvedValue({
+          id: "provider-agent-id",
+          did: "did:agrenting:test",
+          name: "Test provider",
+          capabilities: ["test-capability"],
+        }),
         createTask: vi.fn().mockResolvedValue({
           id: "mock-task-id",
           status: "pending",
@@ -201,6 +207,8 @@ describe("testEnvironment", () => {
 
 describe("execute", () => {
   it("executes a task in polling mode and returns success", async () => {
+    const { AgrentingClient } = await import("./client.js");
+    const MockClient = vi.mocked(AgrentingClient);
     const result = await execute(mockConfig, {
       input: "test input",
       capability: "test-capability",
@@ -210,6 +218,10 @@ describe("execute", () => {
     expect(result.taskId).toBe("mock-task-id");
     expect(result.output).toBe("task output");
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
+    const executionClient = MockClient.mock.results[0]?.value;
+    expect(executionClient.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({ providerAgentId: "provider-agent-id" })
+    );
   });
 
   it("returns error when task fails", async () => {
@@ -220,6 +232,12 @@ describe("execute", () => {
     MockClient.mockImplementationOnce(function() {
       return {
         testConnection: vi.fn(),
+        getAgentProfile: vi.fn().mockResolvedValue({
+          id: "provider-agent-id",
+          did: "did:agrenting:test",
+          name: "Test provider",
+          capabilities: ["test"],
+        }),
         createTask: vi.fn().mockResolvedValue({
           id: "fail-task",
           status: "pending",
@@ -286,6 +304,12 @@ describe("execute", () => {
     MockClient.mockImplementationOnce(function() {
       return {
         testConnection: vi.fn(),
+        getAgentProfile: vi.fn().mockResolvedValue({
+          id: "provider-agent-id",
+          did: "did:agrenting:test",
+          name: "Test provider",
+          capabilities: ["test"],
+        }),
         createTask: vi.fn().mockResolvedValue({
           id: "cancel-task",
           status: "pending",
@@ -345,7 +369,7 @@ describe("execute", () => {
     expect(result.error).toBe("Task was cancelled");
   });
 
-  it("handles escrow payment failure by cancelling the task", async () => {
+  it("uses the escrow payment created atomically with the task", async () => {
     const { AgrentingClient } = await import("./client.js");
     const mockCancel = vi.fn().mockResolvedValue({ id: "pay-fail-task", status: "cancelled" });
     const MockClient = vi.mocked(AgrentingClient);
@@ -361,6 +385,20 @@ describe("execute", () => {
           input: "hello",
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
+          payment: {
+            id: "pay-inline",
+            payment_id: "pay-inline",
+            task_id: "pay-fail-task",
+            amount: "50.00",
+            currency: "USD",
+            status: "escrowed",
+          },
+        }),
+        getAgentProfile: vi.fn().mockResolvedValue({
+          id: "provider-agent-id",
+          did: "did:agrenting:test",
+          name: "Test provider",
+          capabilities: ["test-capability"],
         }),
         getTask: vi.fn(),
         getTaskProgress: vi.fn(),
@@ -370,7 +408,7 @@ describe("execute", () => {
         getBalance: vi.fn(),
         getTransactions: vi.fn(),
         getTaskPayment: vi.fn(),
-        createTaskPayment: vi.fn().mockRejectedValue(new Error("Insufficient funds")),
+        createTaskPayment: vi.fn().mockRejectedValue(new Error("must not be called")),
         deleteWebhook: vi.fn(),
         uploadDocument: vi.fn(),
       };
@@ -382,9 +420,10 @@ describe("execute", () => {
       maxPrice: "50.00",
     });
 
-    expect(result.success).toBe(false);
-    expect(result.error).toContain("Escrow payment failed");
-    expect(mockCancel).toHaveBeenCalledWith("pay-fail-task");
+    expect(result.success).toBe(true);
+    expect(mockCancel).not.toHaveBeenCalled();
+    const executionClient = MockClient.mock.results[0]?.value;
+    expect(executionClient.createTaskPayment).not.toHaveBeenCalled();
   });
 });
 

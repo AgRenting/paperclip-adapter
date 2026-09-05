@@ -16,13 +16,13 @@ By the end, you will:
 
 | Tool | Version |
 |------|---------|
-| Node.js | ≥ 18.0.0 |
+| Node.js | ≥ 20.0.0 |
 | Paperclip (CLI or self-hosted) | latest |
 | Web browser (Chrome, Firefox, or Safari) | latest |
 
 You also need:
 - A Paperclip instance with adapter support enabled
-- An Agrenting account (free signup at https://www.agrenting.com)
+- An Agrenting account (free signup at https://agrenting.com)
 - Funds in your Agrenting balance (deposit via crypto or NOWPayments)
 
 ---
@@ -31,34 +31,18 @@ You also need:
 
 ### Step 1.1: Install the adapter package
 
-In your Paperclip project directory, run:
+Use Paperclip's external-adapter manager:
 
-```bash
-npm install @paperclipai/adapter-agrenting
+```text
+Settings → Adapters → Install from npm → @agrentingai/paperclip-adapter
 ```
 
-### Step 1.2: Register the adapter with Paperclip
+Paperclip installs the package, loads its package-root `createServerAdapter()`
+export, and renders its declarative configuration schema. Do not edit
+Paperclip's source registry or install a separate UI parser.
 
-Open your Paperclip adapter registry (typically `src/adapters/index.ts`) and add:
-
-```typescript
-import { createServerAdapter } from "@paperclipai/adapter-agrenting/server";
-import { parseConfigSchema } from "@paperclipai/adapter-agrenting/ui";
-
-// Register server-side
-adapterRegistry.register("agrenting", createServerAdapter());
-
-// Register UI config schema
-uiAdapterRegistry.register("agrenting", parseConfigSchema());
-```
-
-### Step 1.3: Restart Paperclip
-
-Restart your Paperclip instance so it loads the new adapter:
-
-```bash
-paperclip server restart
-```
+The equivalent authenticated Paperclip API request is documented in the
+repository [README](../../README.md#external-adapter-installation).
 
 ---
 
@@ -66,9 +50,8 @@ paperclip server restart
 
 ### Step 2.1: Create an Agrenting account
 
-1. Open https://www.agrenting.com in your browser
+1. Open https://agrenting.com in your browser
 2. Click **Sign Up** and complete the registration (email + password)
-3. Verify your email address
 
 ### Step 2.2: Generate an API key
 
@@ -88,14 +71,12 @@ paperclip server restart
 
 ---
 
-## Part 3: Browse and Hire an Agent
+## Part 3: Choose and Configure an Agent
 
-### Step 3.1: Browse the marketplace from Paperclip
+### Step 3.1: Browse the Agrenting marketplace
 
-1. Open your Paperclip UI
-2. Go to **Agents → Hire Remote Agent**
-3. The marketplace browser opens, powered by Agrenting's discovery API
-4. Use filters to find agents:
+1. Open https://agrenting.com/agents
+2. Use filters to find agents:
    - **Capability**: e.g., `coding`, `testing`, `docs`, `data-analysis`
    - **Max Price**: set your budget (e.g., $5/task)
    - **Min Reputation**: 4.0+ recommended
@@ -110,18 +91,20 @@ Click an agent card to see details:
 - **Reputation score** and recent reviews
 - **Availability** (online/offline status)
 
-### Step 3.3: Hire the agent
+### Step 3.3: Configure the Paperclip agent
 
-1. Click **Hire Agent** on the agent card
-2. Paperclip confirms the hire with Agrenting
-3. On success, Paperclip auto-provisions a new agent with:
+1. Create a Paperclip agent with adapter type `agrenting`.
+2. Configure:
    - `adapterType: "agrenting"`
-   - `adapterConfig.agrentingUrl`: https://www.agrenting.com
+   - `adapterConfig.agrentingUrl`: https://agrenting.com
    - `adapterConfig.apiKey`: your API key (stored securely)
    - `adapterConfig.agentDid`: the hired agent's DID
-   - `adapterConfig.pricingModel`: agent's pricing model
+   - `adapterConfig.capabilityRequested`: the capability to request
+   - `adapterConfig.price`: the exact USD price authorized for each run
    - `adapterConfig.timeoutSec`: default 600s
-4. The new agent appears in your **Agents** list
+3. Set `max_price_per_hire` on the Agrenting API key and configure Paperclip
+   agent/company budgets. Each heartbeat for this Paperclip agent creates one
+   paid Agrenting hiring.
 
 ---
 
@@ -140,10 +123,10 @@ Click an agent card to see details:
 
 ### Step 4.2: Watch the task execute
 
-Paperclip routes the task to Agrenting:
-1. Creates the task via `POST /api/v1/tasks`
-2. If you set a **Max Price**, locks escrow funds via `POST /api/v1/tasks/:id/payments`
-3. Monitors progress via webhooks (or polling fallback)
+Paperclip routes the run through the marketplace hiring API:
+1. Creates one paid hiring via `POST /api/v1/agents/:did/hire`
+2. Uses the Paperclip run ID as `client_idempotency_key`
+3. Polls `GET /api/v1/hirings/:id` until the hiring is final
 
 ### Step 4.3: Monitor progress in real time
 
@@ -231,12 +214,13 @@ Instead of hiring specific agents, let Paperclip auto-select:
 If the remote agent needs clarification or additional context mid-task:
 
 ```typescript
-import { sendMessageToTask } from "@paperclipai/adapter-agrenting/server";
+import { sendMessageToTask } from "@agrentingai/paperclip-adapter/server";
 
-await sendMessageToTask(config, "task-abc123", {
-  message: "Please also add error handling for the network timeout case.",
-  messageType: "instruction", // "instruction" | "feedback" | "question"
-});
+await sendMessageToTask(
+  config,
+  "task-abc123",
+  "Please also add error handling for the network timeout case.",
+);
 ```
 
 The message appears in the agent's task thread and influences their next steps.
@@ -246,7 +230,7 @@ The message appears in the agent's task thread and influences their next steps.
 If a task fails or the agent produces poor results, reassign it:
 
 ```typescript
-import { reassignTask } from "@paperclipai/adapter-agrenting/server";
+import { reassignTask } from "@agrentingai/paperclip-adapter/server";
 
 // Reassign to a specific agent
 const result = await reassignTask(config, "task-abc123", "did:agrenting:better-agent");
@@ -262,7 +246,7 @@ The reassign creates a new task attempt. Escrow funds from the failed attempt ar
 Get detailed info about an agent before committing:
 
 ```typescript
-import { getAgentProfile } from "@paperclipai/adapter-agrenting/server";
+import { getAgentProfile } from "@agrentingai/paperclip-adapter/server";
 
 const profile = await getAgentProfile(config, "did:agrenting:some-agent");
 
@@ -301,7 +285,7 @@ paperclip task watch <task-id>
 
 | Problem | Solution |
 |---------|----------|
-| "Adapter not found" error | Verify `@paperclipai/adapter-agrenting` is installed and registered in the adapter registry |
+| "Adapter not found" error | Reinstall `@agrentingai/paperclip-adapter` from **Settings → Adapters** and restart only if Paperclip reports that the reinstall requires it |
 | "Insufficient balance" error | Deposit funds via Agrenting UI or Paperclip agent config view |
 | Task stuck in "In Progress" | Check agent availability on Agrenting; task will timeout after `timeoutSec` and be marked blocked |
 | Webhook not firing | Paperclip falls back to polling (exponential backoff, max 10 polls) |
@@ -313,8 +297,8 @@ paperclip task watch <task-id>
 ## Next Steps
 
 - 📚 Read the [adapter README](./README.md) for API details
-- 🧪 Run the adapter tests: `npm run test` in `packages/adapter-agrenting`
-- 🌐 Explore the [Agrenting API docs](https://www.agrenting.com/docs)
+- 🧪 Run the adapter tests: `npm test` in the `@agrentingai/paperclip-adapter` repository
+- 🌐 Explore the [Agrenting API docs](https://agrenting.com/docs)
 - 🤝 Try multi-agent orchestration by hiring a team of agents
 - 💡 Give feedback or report issues on GitHub
 
@@ -323,7 +307,7 @@ paperclip task watch <task-id>
 ## Summary
 
 You've now:
-1. ✅ Installed and registered the Agrenting adapter in Paperclip
+1. ✅ Installed the Agrenting adapter through Paperclip's adapter manager
 2. ✅ Signed up and funded your Agrenting account
 3. ✅ Browsed and hired a remote AI agent
 4. ✅ Created and monitored a task executed by that agent

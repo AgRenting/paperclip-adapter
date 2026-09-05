@@ -32,6 +32,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "lint": "eslint server/src/ ui/src/",
+    "verify": "npm test && npm run typecheck && npm run lint && npm run build",
+    "prepack": "npm run build --silent >/dev/null",
     "prepublishOnly": "npm test && npm run typecheck && npm run lint && npm run build"
   },
   "publishConfig": {

@@ -111,7 +111,22 @@ Create a Paperclip agent with adapter type `agrenting` and configure:
 Each Paperclip run creates one canonical Agrenting hiring and uses the
 Paperclip run ID as `client_idempotency_key`. The adapter polls
 `GET /api/v1/hirings/:id`, returns completed output through Paperclip logs and
-`resultJson`, and best-effort cancels the hiring on timeout.
+`resultJson`, and best-effort cancels the hiring on timeout. If completion wins
+a timeout/cancellation race, the adapter reconciles the final hiring state and
+returns the completed result.
+
+Configuring a Paperclip agent with this adapter authorizes its heartbeats to
+create paid hirings automatically. Set an explicit `price`, use Paperclip's
+agent/company budgets, and set `max_price_per_hire` on the Agrenting key to keep
+that recurring authority bounded.
+
+Completed `resultJson` includes artifact metadata and authenticated
+`download_url` values. Consumers must send the same scoped Agrenting API key
+when downloading; the URLs are not public attachments. Structured agent
+questions are non-blocking: the adapter logs each newly observed question and
+retains it in `resultJson.openQuestions`, but it cannot pause the remote agent
+or submit an answer through Paperclip's external-adapter contract. Use the
+Agrenting Apps v2 MCP connection when an interactive answer flow is required.
 
 `output` is the safe default. For `push`, configure `repoUrl` and store the
 user's GitHub credential in Agrenting first. The canonical Paperclip adapter
@@ -210,6 +225,26 @@ import { parseConfigSchema } from "@agrentingai/paperclip-adapter/ui";
 New Paperclip installations do not need a custom UI parser because Paperclip
 can render the canonical declarative configuration schema and generic run
 output.
+
+The legacy task API supports sending a task message, but the current Agrenting
+REST API does not expose task message history. `getTaskMessages()` therefore
+fails locally with an explicit unsupported-operation error; marketplace work
+should use hiring messages instead.
+
+### Retry and payment safety
+
+Read requests and idempotent `DELETE` requests use bounded retries for network,
+timeout, rate-limit, and server failures. Mutating `POST` requests are **not**
+replayed unless a stable idempotency key is supplied (for example,
+`clientIdempotencyKey` on `hireAgent` or `idempotencyKey` on `createTask`).
+Payment creation is never blindly retried: if the response is ambiguous, the
+adapter performs a read-only payment lookup and returns the existing escrow
+record when available, preventing a second charge.
+
+The legacy `executeWithRetry` helper also defaults to **zero** retries when
+`maxPrice` is set, because each application-level retry submits a fresh paid
+task. Set `allowPaidRetries: true` only after obtaining approval for each
+additional charge.
 
 ## Development
 

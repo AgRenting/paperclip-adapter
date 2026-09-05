@@ -23,11 +23,24 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 3;
+const MAX_RETRY_DELAY_MS = 60_000;
+const SAFE_RETRY_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE"]);
+
+interface RequestOptions {
+  /**
+   * Stable key proving that the server can deduplicate this mutation. Unsafe
+   * methods are retried only when this key is present.
+   */
+  idempotencyKey?: string;
+}
 
 class NonRetryableAgrentingError extends Error {
-  constructor(message: string) {
+  readonly status?: number;
+
+  constructor(message: string, status?: number) {
     super(message);
     this.name = "NonRetryableAgrentingError";
+    this.status = status;
   }
 }
 
@@ -44,18 +57,26 @@ export class AgrentingClient {
     this.apiKey = config.apiKey;
   }
 
-  private headers(): Record<string, string> {
-    return {
+  private headers(idempotencyKey?: string): Record<string, string> {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "X-API-Key": this.apiKey,
     };
+    if (idempotencyKey) headers["X-Idempotency-Key"] = idempotencyKey;
+    return headers;
   }
 
   private async request<T>(
     method: string,
     path: string,
-    body?: unknown
+    body?: unknown,
+    options: RequestOptions = {}
   ): Promise<T> {
+    // A transport failure after a mutating POST may mean the server already
+    // charged or created a resource. Never replay such a request unless the
+    // caller supplied a key that the API can use to deduplicate it.
+    const canRetry = SAFE_RETRY_METHODS.has(method.toUpperCase()) ||
+      Boolean(options.idempotencyKey);
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
@@ -65,14 +86,17 @@ export class AgrentingClient {
       try {
         const response = await fetch(`${this.baseUrl}${path}`, {
           method,
-          headers: this.headers(),
+          headers: this.headers(options.idempotencyKey),
           body: body ? JSON.stringify(body) : undefined,
           signal: controller.signal,
         });
 
         if (!response.ok) {
           const text = await response.text();
-          const shouldRetry = response.status === 429 || response.status >= 500;
+          const shouldRetry =
+            canRetry &&
+            ([408, 425, 429].includes(response.status) ||
+              response.status >= 500);
 
           if (shouldRetry && attempt < MAX_RETRIES) {
             clearTimeout(timer);
@@ -82,13 +106,16 @@ export class AgrentingClient {
             if (retryAfter) {
               // Retry-After can be seconds (integer) or a date string (HTTP-date)
               const seconds = parseInt(retryAfter, 10);
-              if (!Number.isNaN(seconds) && seconds > 0) {
-                delayMs = seconds * 1000;
+              if (!Number.isNaN(seconds) && seconds >= 0) {
+                delayMs = Math.min(seconds * 1000, MAX_RETRY_DELAY_MS);
               } else {
                 // Try parsing as HTTP date
                 const dateMs = Date.parse(retryAfter);
                 if (!Number.isNaN(dateMs)) {
-                  delayMs = Math.max(0, dateMs - Date.now());
+                  delayMs = Math.min(
+                    Math.max(0, dateMs - Date.now()),
+                    MAX_RETRY_DELAY_MS
+                  );
                 }
               }
             }
@@ -97,7 +124,8 @@ export class AgrentingClient {
           }
 
           throw new NonRetryableAgrentingError(
-            `Agrenting API ${response.status}: ${text.slice(0, 500)}`
+            `Agrenting API ${response.status}: ${text.slice(0, 500)}`,
+            response.status
           );
         }
 
@@ -113,7 +141,7 @@ export class AgrentingClient {
         if (lastError instanceof NonRetryableAgrentingError) {
           throw lastError;
         }
-        if (attempt < MAX_RETRIES) {
+        if (canRetry && attempt < MAX_RETRIES) {
           clearTimeout(timer);
           const delayMs = Math.min(1000 * 2 ** attempt, 30_000);
           await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -136,21 +164,43 @@ export class AgrentingClient {
   async createTask(params: {
     providerAgentId: string;
     capability: string;
-    input: string;
+    input: string | Record<string, unknown>;
     /** Max price in USD. If set, the task will have a price for escrow. */
     maxPrice?: string;
     /** Payment type: "crypto" | "escrow" | "nowpayments" */
     paymentType?: string;
+    /** Stable key used by Agrenting to deduplicate a retried task creation. */
+    idempotencyKey?: string;
   }): Promise<AgrentingTask> {
     const body: Record<string, unknown> = {
       provider_agent_id: params.providerAgentId,
       capability: params.capability,
-      input: params.input,
+      input:
+        typeof params.input === "string"
+          ? { prompt: params.input }
+          : params.input,
     };
     if (params.maxPrice) {
       body.max_price = params.maxPrice;
     }
-    return this.request("POST", "/api/v1/tasks", body);
+    if (params.paymentType) body.payment_type = params.paymentType;
+    const task = await this.request<AgrentingTask & { task_id?: string }>(
+      "POST",
+      "/api/v1/tasks",
+      body,
+      { idempotencyKey: params.idempotencyKey }
+    );
+    const id = task.id ?? task.task_id;
+    if (!id) {
+      throw new Error("Agrenting returned task data without a task id");
+    }
+    return {
+      ...task,
+      id,
+      payment: task.payment
+        ? this.normalizePayment(task.payment, id)
+        : undefined,
+    };
   }
 
   /** Create a payment for an existing task to lock escrow funds.
@@ -166,12 +216,55 @@ export class AgrentingClient {
     };
     if (options.cryptoCurrency) body.crypto_currency = options.cryptoCurrency;
     if (options.paymentType) body.payment_type = options.paymentType;
-    return this.request("POST", `/api/v1/tasks/${taskId}/payments`, body);
+    try {
+      // Payment creation is deliberately not retried: this endpoint predates
+      // idempotency headers and a timed-out POST may already have moved funds.
+      const payment = await this.request<PaymentInfo>(
+        "POST",
+        `/api/v1/tasks/${taskId}/payments`,
+        body
+      );
+      return this.normalizePayment(payment, taskId);
+    } catch (error) {
+      // Reconcile an ambiguous transport/server failure with a read before
+      // surfacing the error. This returns the original escrow record when the
+      // POST succeeded but its response was lost, without issuing a second
+      // charge.
+      const status = error instanceof NonRetryableAgrentingError ? error.status : undefined;
+      const ambiguous = status === undefined || [408, 425, 429].includes(status) || status >= 500;
+      if (ambiguous) {
+        try {
+          return await this.getTaskPayment(taskId);
+        } catch {
+          // Preserve the original payment error when reconciliation finds no
+          // existing payment (for example, a failed POST).
+        }
+      }
+      throw error;
+    }
   }
 
   /** Get payment info for a task */
   async getTaskPayment(taskId: string): Promise<PaymentInfo> {
-    return this.request("GET", `/api/v1/tasks/${taskId}/payments`);
+    const payment = await this.request<PaymentInfo>(
+      "GET",
+      `/api/v1/tasks/${taskId}/payments`
+    );
+    return this.normalizePayment(payment, taskId);
+  }
+
+  private normalizePayment(payment: PaymentInfo, taskId: string): PaymentInfo {
+    const id = payment.id ?? payment.payment_id;
+    if (!id) {
+      throw new Error("Agrenting returned payment data without a payment id");
+    }
+    return {
+      ...payment,
+      id,
+      payment_id: payment.payment_id ?? id,
+      task_id: payment.task_id ?? taskId,
+      currency: payment.currency ?? "USD",
+    };
   }
 
   /** Get the status and result of a task */
@@ -443,7 +536,8 @@ export class AgrentingClient {
     return this.request(
       "POST",
       `/api/v1/agents/${encodeURIComponent(agentDid)}/hire`,
-      body
+      body,
+      { idempotencyKey: options.clientIdempotencyKey }
     );
   }
 
@@ -454,19 +548,29 @@ export class AgrentingClient {
     taskId: string,
     options: SendMessageOptions
   ): Promise<SendMessageResult> {
-    return this.request("POST", `/api/v1/tasks/${taskId}/messages`, {
-      message: options.message,
-      message_type: options.messageType ?? "instruction",
+    const message = await this.request<{
+      id?: string;
+      message_id?: string;
+      inserted_at?: string;
+      sent_at?: string;
+    }>("POST", `/api/v1/tasks/${taskId}/messages`, {
+      content: options.message,
     });
+    return {
+      message_id: message.message_id ?? message.id ?? "",
+      task_id: taskId,
+      sent_at: message.sent_at ?? message.inserted_at ?? new Date().toISOString(),
+    };
   }
 
-  /** Get messages for a task.
-   * GET /api/v1/tasks/:id/messages
+  /**
+   * Task message history is unavailable in the current Agrenting REST API.
+   * Kept as an explicit compatibility error so older callers fail locally
+   * instead of polling a route that does not exist.
    */
   async getTaskMessages(taskId: string): Promise<TaskMessage[]> {
-    return this.request<TaskMessage[]>(
-      "GET",
-      `/api/v1/tasks/${taskId}/messages`
+    throw new Error(
+      `Agrenting does not expose task message history for ${taskId}; use hiring messages for marketplace work.`
     );
   }
 
@@ -477,15 +581,25 @@ export class AgrentingClient {
     taskId: string,
     newAgentDid?: string
   ): Promise<ReassignTaskResult> {
-    const body: Record<string, unknown> = {};
-    if (newAgentDid) {
-      body.new_provider_agent_did = newAgentDid;
+    let providerAgentId: string | undefined;
+    if (newAgentDid?.startsWith("did:")) {
+      providerAgentId = (await this.getAgentProfile(newAgentDid)).id;
+    } else {
+      providerAgentId = newAgentDid;
     }
-    return this.request<ReassignTaskResult>(
+    const body: Record<string, unknown> = {};
+    if (providerAgentId) body.provider_agent_id = providerAgentId;
+    const task = await this.request<AgrentingTask>(
       "POST",
       `/api/v1/tasks/${taskId}/reassign`,
       body
     );
+    return {
+      task_id: task.id,
+      new_agent_did: newAgentDid,
+      new_provider_agent_id: task.provider_agent_id,
+      status: task.status,
+    };
   }
 
   /** List all available capabilities with descriptions and usage stats.

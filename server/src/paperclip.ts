@@ -13,6 +13,8 @@ import type {
   AgentProfile,
   AgrentingAdapterConfig,
   Hiring,
+  HiringArtifact,
+  HiringQuestion,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -175,6 +177,17 @@ function taskInputFrom(ctx: AdapterExecutionContext): Record<string, unknown> {
   return input;
 }
 
+function artifactCompletionText(hiring: Hiring): string | null {
+  const artifacts = hiring.artifacts ?? [];
+  if (artifacts.length === 0) return null;
+  const names = artifacts
+    .map((artifact) => nonEmpty(artifact.name))
+    .filter((name): name is string => Boolean(name));
+  const noun = artifacts.length === 1 ? "artifact" : "artifacts";
+  const suffix = names.length > 0 ? `: ${names.join(", ")}` : "";
+  return `Agrenting hiring ${hiring.id} completed with ${artifacts.length} ${noun}${suffix}.`;
+}
+
 function outputText(hiring: Hiring): string {
   const output = hiring.task_output;
   if (typeof output === "string" && output.trim()) return output;
@@ -184,9 +197,39 @@ function outputText(hiring: Hiring): string {
       const direct = nonEmpty(record[key]);
       if (direct) return direct;
     }
+    if (Object.keys(record).length === 0) {
+      return artifactCompletionText(hiring) ?? `Agrenting hiring ${hiring.id} completed.`;
+    }
     return JSON.stringify(record, null, 2);
   }
-  return `Agrenting hiring ${hiring.id} completed.`;
+  return artifactCompletionText(hiring) ?? `Agrenting hiring ${hiring.id} completed.`;
+}
+
+function artifactResults(
+  artifacts: HiringArtifact[] | undefined,
+  baseUrl: string
+): Array<HiringArtifact & { download_url: string }> {
+  const origin = new URL(`${baseUrl.replace(/\/+$/, "")}/`);
+
+  return (artifacts ?? []).map((artifact) => ({
+    ...artifact,
+    download_url: authenticatedArtifactUrl(artifact, origin),
+  }));
+}
+
+function authenticatedArtifactUrl(artifact: HiringArtifact, origin: URL): string {
+  const canonical = new URL(
+    `/api/v1/artifacts/${encodeURIComponent(artifact.id)}/download`,
+    origin
+  );
+  if (!artifact.download_url) return canonical.toString();
+
+  try {
+    const supplied = new URL(artifact.download_url, origin);
+    return supplied.origin === origin.origin ? supplied.toString() : canonical.toString();
+  } catch {
+    return canonical.toString();
+  }
 }
 
 function firstLine(value: string): string {
@@ -202,7 +245,9 @@ function sleep(ms: number): Promise<void> {
 
 function resultForFailure(
   hiring: Hiring,
-  message: string
+  message: string,
+  baseUrl: string,
+  openQuestions: HiringQuestion[]
 ): AdapterExecutionResult {
   return {
     exitCode: 1,
@@ -218,6 +263,8 @@ function resultForFailure(
       hiringId: hiring.id,
       status: hiring.status,
       failedReason: hiring.failed_reason ?? null,
+      artifacts: artifactResults(hiring.artifacts, baseUrl),
+      openQuestions,
     },
   };
 }
@@ -283,10 +330,25 @@ export async function executePaperclip(
     const deadline = Date.now() + timeoutMs;
     let hiring = created.hiring;
     let lastStatus = hiring.status;
+    const openQuestions = new Map<string, HiringQuestion>();
+
+    const recordOpenQuestions = async (snapshot: Hiring): Promise<void> => {
+      for (const question of snapshot.open_questions ?? []) {
+        if (!question.question_id || openQuestions.has(question.question_id)) continue;
+        openQuestions.set(question.question_id, question);
+        await ctx.onLog(
+          "stderr",
+          `[agrenting] Open question ${question.question_id}: ${question.content}\n`
+        );
+      }
+    };
+
+    await recordOpenQuestions(hiring);
 
     while (!TERMINAL_STATUSES.has(hiring.status) && Date.now() < deadline) {
       await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())));
       hiring = await client.getHiring(hiringId);
+      await recordOpenQuestions(hiring);
       if (hiring.status !== lastStatus) {
         lastStatus = hiring.status;
         await ctx.onLog(
@@ -308,24 +370,43 @@ export async function executePaperclip(
           "stderr",
           `[agrenting] Hiring ${hiringId} timed out; cancellation failed: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}\n`
         );
+        try {
+          const reconciled = await client.getHiring(hiringId);
+          await recordOpenQuestions(reconciled);
+          if (TERMINAL_STATUSES.has(reconciled.status)) {
+            hiring = reconciled;
+          }
+        } catch {
+          // The timeout remains indeterminate when neither cancellation nor a
+          // final status read can confirm the remote hiring's outcome.
+        }
       }
-      return {
-        exitCode: null,
-        signal: null,
-        timedOut: true,
-        errorCode: "agrenting_hiring_timeout",
-        errorMessage: `Agrenting hiring ${hiringId} timed out after ${config.timeoutSec ?? DEFAULT_TIMEOUT_SEC}s.`,
-        provider: "agrenting",
-        biller: "agrenting",
-        sessionParams: { hiringId },
-        sessionDisplayId: hiringId,
-      };
+      if (!TERMINAL_STATUSES.has(hiring.status)) {
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: true,
+          errorCode: "agrenting_hiring_timeout",
+          errorMessage: `Agrenting hiring ${hiringId} timed out after ${config.timeoutSec ?? DEFAULT_TIMEOUT_SEC}s.`,
+          provider: "agrenting",
+          biller: "agrenting",
+          sessionParams: { hiringId },
+          sessionDisplayId: hiringId,
+          resultJson: {
+            hiringId,
+            status: hiring.status,
+            openQuestions: Array.from(openQuestions.values()),
+          },
+        };
+      }
     }
 
     if (hiring.status !== "completed") {
       return resultForFailure(
         hiring,
-        hiring.failed_reason ?? `Agrenting hiring ended with status ${hiring.status}.`
+        hiring.failed_reason ?? `Agrenting hiring ended with status ${hiring.status}.`,
+        config.agrentingUrl,
+        Array.from(openQuestions.values())
       );
     }
 
@@ -347,6 +428,8 @@ export async function executePaperclip(
         hiringId,
         status: hiring.status,
         taskOutput: hiring.task_output ?? null,
+        artifacts: artifactResults(hiring.artifacts, config.agrentingUrl),
+        openQuestions: Array.from(openQuestions.values()),
       },
     };
   } catch (error) {

@@ -90,6 +90,8 @@ export type {
   Hiring,
   TaskMessage,
   HiringMessage,
+  HiringQuestion,
+  HiringArtifact,
   Capability,
   AutoSelectOptions,
   RetryHiringOptions,
