@@ -440,6 +440,30 @@ describe("canonical Paperclip adapter", () => {
     expect(clientMocks.getAgentProfile).toHaveBeenCalledTimes(1);
   });
 
+  it("returns accepted hiring recovery state even when the host logger fails", async () => {
+    clientMocks.hireAgent.mockResolvedValue({
+      hiring: { id: "hiring-log-outage", status: "in_progress", price: "7.50" },
+    });
+    const ctx = executionContext();
+    ctx.onLog = vi.fn().mockResolvedValueOnce(undefined)
+      .mockRejectedValue(new Error("Host log storage unavailable"));
+    const failed = await executePaperclip(ctx);
+    expect(failed).toMatchObject({
+      exitCode: 1,
+      sessionParams: { hiringId: "hiring-log-outage", recoveryRequired: true },
+    });
+    clientMocks.getHiring.mockResolvedValue({
+      id: "hiring-log-outage", status: "completed", task_output: "Recovered after log outage",
+    });
+    const next = executionContext();
+    next.runId = "next-run";
+    next.runtime.sessionParams = failed.sessionParams ?? null;
+    await expect(executePaperclip(next)).resolves.toMatchObject({
+      exitCode: 0, summary: "Recovered after log outage",
+    });
+    expect(clientMocks.hireAgent).toHaveBeenCalledTimes(1);
+  });
+
   it("does not create a replacement when recovery status cannot be read", async () => {
     const ctx = executionContext();
     ctx.runtime.sessionParams = { hiringId: "hiring-unknown", recoveryRequired: true };

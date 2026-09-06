@@ -529,7 +529,11 @@ export async function executePaperclip(
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const transient = /\b(429|5\d\d)\b|rate.?limit|temporar|timeout/i.test(message);
-    await ctx.onLog("stderr", `[agrenting] ${message}\n`);
+    try {
+      await ctx.onLog("stderr", `[agrenting] ${message}\n`);
+    } catch {
+      // A host logging outage must not discard the original paid-work recovery state.
+    }
     return {
       exitCode: 1,
       signal: null,
