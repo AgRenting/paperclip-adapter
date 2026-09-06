@@ -89,7 +89,15 @@ export class AgrentingClient {
           headers: this.headers(options.idempotencyKey),
           body: body ? JSON.stringify(body) : undefined,
           signal: controller.signal,
+          redirect: "manual",
         });
+
+        if (response.status >= 300 && response.status < 400) {
+          throw new NonRetryableAgrentingError(
+            "Agrenting API redirect rejected; configure the canonical marketplace URL.",
+            response.status
+          );
+        }
 
         if (!response.ok) {
           const text = await response.text();

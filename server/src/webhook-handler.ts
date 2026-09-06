@@ -13,6 +13,7 @@
 import type { IncomingHttpHeaders } from "http";
 import type { AgrentingAdapterConfig } from "./types.js";
 import { verifyWebhookSignature } from "./crypto.js";
+import { AgrentingClient } from "./client.js";
 
 // ---------------------------------------------------------------------------
 // Task → Issue mapping registry
@@ -226,6 +227,7 @@ export interface WebhookHandlerOptions {
  * Fastify, or a raw Node.js http server.
  */
 export function createWebhookHandler(options: WebhookHandlerOptions) {
+  if (!options.webhookSecret.trim()) throw new Error("A webhook signing secret is required.");
   startRegistryCleanup();
   return async function handleWebhookRequest(
     rawBody: string,
@@ -271,8 +273,25 @@ export function createWebhookHandler(options: WebhookHandlerOptions) {
       return { status: 200, body: "OK (no active mapping)" };
     }
 
+    // Terminal callback headers and payload output are notifications only.
+    // Authorize the transition and result through the mapped account's API.
+    let canonicalEventType = eventType;
+    if (["task.completed", "task.failed", "task.cancelled"].includes(eventType)) {
+      try {
+        const task = await new AgrentingClient(mapping.config).getTask(taskId);
+        if (task.id !== taskId) throw new Error("Canonical task ID mismatch");
+        if (!["completed", "failed", "cancelled"].includes(task.status)) {
+          return { status: 200, body: "OK (task still active)" };
+        }
+        canonicalEventType = `task.${task.status}`;
+        payload = { task_id: task.id, status: task.status, output: task.output, error_reason: task.error_reason };
+      } catch {
+        return { status: 503, body: "Canonical task status unavailable" };
+      }
+    }
+
     // Dispatch to event handler
-    const handler = eventHandlers[eventType];
+    const handler = eventHandlers[canonicalEventType];
     if (handler) {
       try {
         await handler({ api: options.api, mapping, payload });

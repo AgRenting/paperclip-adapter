@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   AdapterConfigSchema,
   AdapterEnvironmentCheck,
@@ -15,6 +16,7 @@ import type {
   Hiring,
   HiringArtifact,
   HiringQuestion,
+  HireAgentOptions,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -46,7 +48,8 @@ Recommended API-key scopes:
 - set max_price_per_hire on the key to cap paid actions
 
 Execution:
-- Each Paperclip run creates one canonical Agrenting hiring.
+- Each new Paperclip task execution creates one canonical Agrenting hiring.
+- Recovery runs resume or replay the original hiring from persisted session state.
 - The Paperclip run id is sent as client_idempotency_key so safe retries deduplicate.
 - Paperclip polls the hiring until it completes, fails, is cancelled, or times out.
 - Push delivery can use a repository URL from Paperclip and an Agrenting-stored
@@ -257,7 +260,7 @@ function resultForFailure(
     errorCode: `agrenting_hiring_${hiring.status}`,
     provider: "agrenting",
     biller: "agrenting",
-    sessionParams: { hiringId: hiring.id },
+    sessionParams: { hiringId: hiring.id, recoveryRequired: false },
     sessionDisplayId: hiring.id,
     resultJson: {
       hiringId: hiring.id,
@@ -267,6 +270,39 @@ function resultForFailure(
       openQuestions,
     },
   };
+}
+
+function pendingCreation(
+  agentDid: string,
+  request: HireAgentOptions,
+  apiKey: string
+): Record<string, unknown> {
+  const serialized = JSON.stringify(request);
+  // Auth config never enters a request snapshot. If task/repository context
+  // contains credential material, retain only the key and require reconciliation.
+  const sensitive = serialized.includes(apiKey) ||
+    /Bearer\s+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|ap_[A-Za-z0-9]{16,}|https?:\/\/[^/\s"]*@/i.test(serialized) ||
+    /"[^" ]*(?:token|secret|password|authorization|api[_-]?key)[^" ]*"\s*:/i.test(serialized);
+  return {
+    idempotencyKey: request.clientIdempotencyKey,
+    agentDid,
+    ...(sensitive ? { manualOnly: true } : { request: JSON.parse(serialized) }),
+  };
+}
+
+function requestFromRecovery(pending: Record<string, unknown>): HireAgentOptions | null {
+  const request = asRecord(pending.request);
+  if (pending.manualOnly || !request ||
+      !nonEmpty(pending.agentDid) || !nonEmpty(pending.idempotencyKey) ||
+      request.clientIdempotencyKey !== pending.idempotencyKey ||
+      !nonEmpty(request.taskDescription) || !nonEmpty(request.capabilityRequested) ||
+      !(typeof request.price === "string" || typeof request.price === "number") ||
+      !(request.deliveryMode === "output" || request.deliveryMode === "push") ||
+      (request.repoUrl !== undefined && typeof request.repoUrl !== "string") ||
+      (request.taskInput !== undefined && !asRecord(request.taskInput))) return null;
+  const allowed = new Set(["taskDescription", "capabilityRequested", "price", "deliveryMode", "clientIdempotencyKey", "taskInput", "repoUrl"]);
+  if (Object.keys(request).some((key) => !allowed.has(key))) return null;
+  return request as unknown as HireAgentOptions;
 }
 
 /** Canonical Paperclip ServerAdapterModule execution entry point. */
@@ -284,54 +320,111 @@ export async function executePaperclip(
     };
   }
 
+  const priorSession = asRecord(ctx.runtime.sessionParams);
+  const priorHiringId = nonEmpty(priorSession?.hiringId);
+  // Old sessions stored only the display ID; inspect those before spending too.
+  let hiringId = priorSession?.recoveryRequired !== false ? priorHiringId : null;
+  let pendingCreate = priorSession?.recoveryRequired === true && !hiringId
+    ? asRecord(priorSession.pendingCreate) ?? { manualOnly: true } : null;
+  let hiring: Hiring | undefined;
+  let offeredPrice: string | undefined;
+  let legacyTerminalResult = false;
+  const credentialFingerprint = createHash("sha256").update(config.apiKey).digest("hex");
+  let recoveryFingerprint = hiringId || pendingCreate
+    ? nonEmpty(priorSession?.credentialFingerprint) ?? credentialFingerprint
+    : credentialFingerprint;
+  let recoveryUrl = hiringId || pendingCreate
+    ? nonEmpty(priorSession?.agrentingUrl) ?? config.agrentingUrl
+    : config.agrentingUrl;
+  const sessionForRecovery = (): Record<string, unknown> => ({
+    ...(hiringId ? { hiringId } : {}),
+    ...(pendingCreate ? { pendingCreate } : {}),
+    recoveryRequired: true,
+    agrentingUrl: recoveryUrl,
+    credentialFingerprint: recoveryFingerprint,
+  });
+  const openQuestions = new Map<string, HiringQuestion>();
   const client = new AgrentingClient(config);
   try {
-    const profile = await client.getAgentProfile(config.agentDid);
-    const capability = capabilityFrom(config, ctx.context, profile);
-    const price = priceFrom(config, ctx.context, profile);
-    if (!capability) {
-      throw new Error(
-        "No capabilityRequested was configured and the Agrenting agent profile has no capabilities."
-      );
+    if (hiringId || pendingCreate) {
+      if (new URL(recoveryUrl).href.replace(/\/+$/, "") !== new URL(config.agrentingUrl).href.replace(/\/+$/, "") ||
+          recoveryFingerprint !== credentialFingerprint) {
+        throw new Error("Restore the original Agrenting URL and credential to reconcile the saved hiring before creating another.");
+      }
     }
-    if (!price) {
-      throw new Error(
-        "No price was configured and the Agrenting agent profile has no base_price."
-      );
+    if (pendingCreate && !hiringId) {
+      const request = requestFromRecovery(pendingCreate);
+      if (!request) {
+        throw new Error("Manual reconciliation required for the original hiring idempotency key; no replacement was created.");
+      }
+      offeredPrice = String(request.price);
+      const recovered = await client.hireAgent(String(pendingCreate.agentDid), request);
+      hiring = recovered.hiring;
+      hiringId = hiring.id;
+      pendingCreate = null;
+    } else if (hiringId) {
+      hiring = await client.getHiring(hiringId);
+      // Older sessions do not say whether a terminal result was reported. Read
+      // it once without creating a replacement or booking the same cost twice.
+      legacyTerminalResult = priorSession?.recoveryRequired !== true &&
+        TERMINAL_STATUSES.has(hiring.status);
+      await ctx.onLog("stdout", `[agrenting] Resuming hiring ${hiringId} with status ${hiring.status}\n`);
     }
 
-    const taskDescription = taskDescriptionFrom(ctx);
-    await ctx.onLog(
-      "stdout",
-      `[agrenting] Hiring ${config.agentDid} for ${capability} at ${price}\n`
-    );
-    const created = await client.hireAgent(config.agentDid, {
-      taskDescription,
-      capabilityRequested: capability,
-      price,
-      deliveryMode: config.deliveryMode,
-      clientIdempotencyKey: ctx.runId,
-      taskInput: taskInputFrom(ctx),
-      repoUrl: repoUrlFrom(ctx),
-    });
-    const hiringId = created.hiring.id;
-    await ctx.onMeta?.({
-      adapterType: type,
-      command: "POST /api/v1/agents/:did/hire",
-      context: { hiringId, agentDid: config.agentDid, capability, price },
-    });
-    await ctx.onLog(
-      "stdout",
-      `[agrenting] Hiring ${hiringId} created with status ${created.hiring.status}\n`
-    );
+    if (!hiring) {
+      const profile = await client.getAgentProfile(config.agentDid);
+      const capability = capabilityFrom(config, ctx.context, profile);
+      const price = priceFrom(config, ctx.context, profile);
+      offeredPrice = price ?? undefined;
+      if (!capability) {
+        throw new Error(
+          "No capabilityRequested was configured and the Agrenting agent profile has no capabilities."
+        );
+      }
+      if (!price) {
+        throw new Error(
+          "No price was configured and the Agrenting agent profile has no base_price."
+        );
+      }
 
+      const taskDescription = taskDescriptionFrom(ctx);
+      await ctx.onLog(
+        "stdout",
+        `[agrenting] Hiring ${config.agentDid} for ${capability} at ${price}\n`
+      );
+      const request: HireAgentOptions = {
+        taskDescription,
+        capabilityRequested: capability,
+        price,
+        deliveryMode: config.deliveryMode,
+        clientIdempotencyKey: ctx.runId,
+        taskInput: taskInputFrom(ctx),
+        repoUrl: repoUrlFrom(ctx),
+      };
+      pendingCreate = pendingCreation(config.agentDid, request, config.apiKey);
+      recoveryUrl = config.agrentingUrl;
+      recoveryFingerprint = credentialFingerprint;
+      const created = await client.hireAgent(config.agentDid, request);
+      hiring = created.hiring;
+      hiringId = hiring.id;
+      pendingCreate = null;
+      recoveryUrl = config.agrentingUrl;
+      await ctx.onMeta?.({
+        adapterType: type,
+        command: "POST /api/v1/agents/:did/hire",
+        context: { hiringId, agentDid: config.agentDid, capability, price },
+      });
+      await ctx.onLog(
+        "stdout",
+        `[agrenting] Hiring ${hiringId} created with status ${created.hiring.status}\n`
+      );
+    }
+    // The ID is saved before log/meta hooks and before any polling can fail.
+    const activeHiringId = hiring.id;
     const timeoutMs = (config.timeoutSec ?? DEFAULT_TIMEOUT_SEC) * 1_000;
     const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
     const deadline = Date.now() + timeoutMs;
-    let hiring = created.hiring;
     let lastStatus = hiring.status;
-    const openQuestions = new Map<string, HiringQuestion>();
-
     const recordOpenQuestions = async (snapshot: Hiring): Promise<void> => {
       for (const question of snapshot.open_questions ?? []) {
         if (!question.question_id || openQuestions.has(question.question_id)) continue;
@@ -347,7 +440,7 @@ export async function executePaperclip(
 
     while (!TERMINAL_STATUSES.has(hiring.status) && Date.now() < deadline) {
       await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())));
-      hiring = await client.getHiring(hiringId);
+      hiring = await client.getHiring(activeHiringId);
       await recordOpenQuestions(hiring);
       if (hiring.status !== lastStatus) {
         lastStatus = hiring.status;
@@ -360,10 +453,11 @@ export async function executePaperclip(
 
     if (!TERMINAL_STATUSES.has(hiring.status)) {
       try {
-        await client.cancelHiring(hiringId);
+        hiring = await client.cancelHiring(activeHiringId);
+        await recordOpenQuestions(hiring);
         await ctx.onLog(
           "stderr",
-          `[agrenting] Hiring ${hiringId} timed out and was cancelled\n`
+          `[agrenting] Hiring ${hiringId} timed out; cancellation returned status ${hiring.status}\n`
         );
       } catch (cancelError) {
         await ctx.onLog(
@@ -371,7 +465,7 @@ export async function executePaperclip(
           `[agrenting] Hiring ${hiringId} timed out; cancellation failed: ${cancelError instanceof Error ? cancelError.message : String(cancelError)}\n`
         );
         try {
-          const reconciled = await client.getHiring(hiringId);
+          const reconciled = await client.getHiring(activeHiringId);
           await recordOpenQuestions(reconciled);
           if (TERMINAL_STATUSES.has(reconciled.status)) {
             hiring = reconciled;
@@ -390,7 +484,7 @@ export async function executePaperclip(
           errorMessage: `Agrenting hiring ${hiringId} timed out after ${config.timeoutSec ?? DEFAULT_TIMEOUT_SEC}s.`,
           provider: "agrenting",
           biller: "agrenting",
-          sessionParams: { hiringId },
+          sessionParams: sessionForRecovery(),
           sessionDisplayId: hiringId,
           resultJson: {
             hiringId,
@@ -412,7 +506,7 @@ export async function executePaperclip(
 
     const output = outputText(hiring);
     await ctx.onLog("stdout", `${output}\n`);
-    const numericPrice = Number(hiring.price ?? price);
+    const numericPrice = Number(hiring.price ?? offeredPrice);
     return {
       exitCode: 0,
       signal: null,
@@ -420,8 +514,8 @@ export async function executePaperclip(
       provider: "agrenting",
       biller: "agrenting",
       billingType: "fixed",
-      costUsd: Number.isFinite(numericPrice) ? numericPrice : null,
-      sessionParams: { hiringId },
+      costUsd: !legacyTerminalResult && Number.isFinite(numericPrice) ? numericPrice : null,
+      sessionParams: { hiringId, recoveryRequired: false },
       sessionDisplayId: hiringId,
       summary: firstLine(output),
       resultJson: {
@@ -440,11 +534,22 @@ export async function executePaperclip(
       exitCode: 1,
       signal: null,
       timedOut: false,
-      errorCode: "agrenting_hiring_failed",
-      errorFamily: transient ? "transient_upstream" : null,
+      errorCode: pendingCreate && !requestFromRecovery(pendingCreate)
+        ? "agrenting_hiring_reconciliation_required" : "agrenting_hiring_failed",
+      errorFamily: transient && (!pendingCreate || requestFromRecovery(pendingCreate))
+        ? "transient_upstream" : null,
       errorMessage: message,
       provider: "agrenting",
       biller: "agrenting",
+      ...(hiringId || pendingCreate ? {
+        sessionParams: sessionForRecovery(),
+        sessionDisplayId: hiringId,
+        resultJson: {
+          hiringId,
+          status: hiring?.status ?? "unknown",
+          openQuestions: Array.from(openQuestions.values()),
+        },
+      } : {}),
     };
   }
 }

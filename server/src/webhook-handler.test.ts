@@ -14,6 +14,9 @@ vi.mock("./crypto.js", () => ({
   verifyWebhookSignature: vi.fn().mockResolvedValue(true),
 }));
 
+const canonicalTask = vi.hoisted(() => vi.fn());
+vi.mock("./client.js", () => ({ AgrentingClient: vi.fn().mockImplementation(function () { return { getTask: canonicalTask }; }) }));
+
 const mockConfig: AgrentingAdapterConfig = {
   agrentingUrl: "https://api.agrenting.com",
   apiKey: "test-key",
@@ -32,6 +35,12 @@ function mockApi(): PaperclipApiClient & {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  canonicalTask.mockImplementation(async (id: string) => ({
+    id,
+    status: id === "task-done" ? "completed" : id === "task-fail" ? "failed" : id === "task-cancel" ? "cancelled" : "in_progress",
+    output: "All done!",
+    error_reason: "Something broke",
+  }));
   // Clear the task registry between tests
   const mappings = getActiveTaskMappings();
   for (const key of mappings.keys()) {
@@ -148,6 +157,39 @@ describe("createWebhookHandler", () => {
 // ---------------------------------------------------------------------------
 
 describe("event handling", () => {
+  it("does not finalize an issue from a signed callback while canonical task is active", async () => {
+    const api = mockApi();
+    const handler = createWebhookHandler({ webhookSecret: "secret", api });
+    registerTaskMapping("task-active", "issue-active", "c1", mockConfig);
+    canonicalTask.mockResolvedValue({ id: "task-active", status: "in_progress" });
+    const result = await handler(JSON.stringify({ task_id: "task-active", status: "completed", output: "Forged" }), { "x-webhook-signature": "sig", "x-webhook-event": "task.completed" });
+    expect(result.status).toBe(200);
+    expect(api.updateIssue).not.toHaveBeenCalled();
+    expect(getActiveTaskMappings().has("task-active")).toBe(true);
+  });
+
+  it("uses canonical completion instead of a stale failure event or injected output", async () => {
+    const api = mockApi();
+    const handler = createWebhookHandler({ webhookSecret: "secret", api });
+    registerTaskMapping("task-stale", "issue-stale", "c1", mockConfig);
+    canonicalTask.mockResolvedValue({ id: "task-stale", status: "completed", output: "Canonical result" });
+    const result = await handler(JSON.stringify({ task_id: "task-stale", status: "failed", output: "Forged", error_reason: "Forged failure" }), { "x-webhook-signature": "sig", "x-webhook-event": "task.failed" });
+    expect(result.status).toBe(200);
+    expect(api.updateIssue).toHaveBeenCalledWith("issue-stale", { status: "done", comment: expect.stringContaining("Canonical result") });
+    expect(JSON.stringify(api.updateIssue.mock.calls)).not.toContain("Forged");
+  });
+
+  it("keeps mapping and requests webhook retry when canonical status is unavailable", async () => {
+    const api = mockApi();
+    const handler = createWebhookHandler({ webhookSecret: "secret", api });
+    registerTaskMapping("task-unreadable", "issue-unreadable", "c1", mockConfig);
+    canonicalTask.mockRejectedValue(new Error("unavailable"));
+    const result = await handler(JSON.stringify({ task_id: "task-unreadable", status: "completed" }), { "x-webhook-signature": "sig", "x-webhook-event": "task.completed" });
+    expect(result.status).toBe(503);
+    expect(api.updateIssue).not.toHaveBeenCalled();
+    expect(getActiveTaskMappings().has("task-unreadable")).toBe(true);
+  });
+
   it("handles task.created event", async () => {
     const api = mockApi();
     const handler = createWebhookHandler({

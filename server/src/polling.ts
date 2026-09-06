@@ -99,6 +99,10 @@ export async function pollTaskUntilDone(
       });
     }
 
+    // A callback/timeout may win while backoff is waiting. Do not start another
+    // authenticated read after cancellation or after the original deadline.
+    if (options.signal?.aborted || Date.now() >= options.deadline) continue;
+
     const task = await client.getTask(options.taskId);
     pollAttempt++;
 

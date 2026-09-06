@@ -206,3 +206,11 @@ describe("pollTaskUntilDone", () => {
     expect(result.result.error).toBe("Task was cancelled");
   });
 });
+
+ it("does not start a task read when aborted during polling backoff", async () => {
+  const controller = new AbortController();
+  const running = pollTaskUntilDone({ config: mockConfig, taskId: "task-1", startAttempt: 1, deadline: Date.now() + 600000, signal: controller.signal });
+  controller.abort();
+  const result = await running;
+  expect(result.result).toMatchObject({ success: false, error: "Polling aborted" });
+});

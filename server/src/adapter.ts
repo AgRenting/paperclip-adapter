@@ -24,7 +24,7 @@ import {
   paperclipSessionCodec,
 } from "./paperclip.js";
 import { registerTaskMapping } from "./webhook-handler.js";
-import { pollTaskUntilDone } from "./polling.js";
+import { getWebhookGracePeriodMs, pollTaskUntilDone } from "./polling.js";
 import { canSubmitTask } from "./balance-monitor.js";
 import { verifyWebhookSignature } from "./crypto.js";
 import { formatAgentResponse } from "./comment-sync.js";
@@ -45,10 +45,12 @@ const pendingTasks = new Map<
     startedAt: number;
     createdAt: number;
     settled: boolean;
+    client: AgrentingClient;
   }
 >();
 
 let webhookServer: ReturnType<typeof import("http").createServer> | null = null;
+let webhookListenerSecret: string | null = null;
 let staleCleanupTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -143,7 +145,12 @@ export async function testEnvironment(
 export async function startWebhookListener(
   config: AgrentingAdapterConfig
 ): Promise<string> {
+  const secret = config.webhookSecret;
+  if (!secret?.trim()) throw new Error("A webhook signing secret is required to start the listener.");
   if (webhookServer) {
+    if (webhookListenerSecret !== secret) {
+      throw new Error("The webhook listener is already configured with a different signing secret.");
+    }
     const addr = webhookServer.address();
     const port =
       typeof addr === "object" && addr ? addr.port : DEFAULT_WEBHOOK_PORT;
@@ -182,7 +189,6 @@ export async function startWebhookListener(
         if (bodyTooLarge) return;
         const rawBody = Buffer.concat(bodyChunks).toString("utf8");
         bodyChunks = []; // free reference for GC
-        const taskId = req.headers["x-webhook-task-id"] as string | undefined;
         const signature =
           (req.headers["x-webhook-signature"] as string) || "";
 
@@ -195,68 +201,45 @@ export async function startWebhookListener(
           return;
         }
 
-        // Verify signature if secret is configured
-        if (config.webhookSecret) {
-          if (!signature) {
-            res.writeHead(401);
-            res.end("Missing signature");
-            return;
-          }
-          const valid = await verifyWebhookSignature(
-            rawBody,
-            signature,
-            config.webhookSecret
-          );
-          if (!valid) {
-            res.writeHead(401);
-            res.end("Invalid signature");
-            return;
-          }
+        if (!await verifyWebhookSignature(rawBody, signature, secret)) {
+          res.writeHead(401);
+          res.end("Invalid or missing signature");
+          return;
+        }
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          res.writeHead(400);
+          res.end("Invalid payload");
+          return;
         }
 
-        // Extract task ID from payload if not in header
-        const resolvedTaskId =
-          taskId ??
-          (payload.task_id as string) ??
-          (payload.taskId as string);
-
-        if (resolvedTaskId) {
-          const pending = pendingTasks.get(resolvedTaskId);
-          if (pending && !pending.settled) {
-            const status = (payload.status as AgrentingTaskStatus) ?? pending.status;
-            pending.status = status;
-            pending.progressPercent =
-              (payload.progress_percent as number) ?? pending.progressPercent;
-            pending.progressMessage =
-              (payload.progress_message as string) ?? pending.progressMessage;
-
-            if (status === "completed") {
-              pending.settled = true;
-              pending.resolve({
-                success: true,
-                output: (payload.output as string) ?? JSON.stringify(payload.output ?? {}),
-                taskId: resolvedTaskId,
-                durationMs: Date.now() - pending.startedAt,
-              });
-            } else if (status === "failed") {
-              pending.settled = true;
-              pending.resolve({
-                success: false,
-                error:
-                  (payload.error_reason as string) ??
-                  "Task failed with no reason provided",
-                taskId: resolvedTaskId,
-                durationMs: Date.now() - pending.startedAt,
-              });
-            } else if (status === "cancelled") {
-              pending.settled = true;
-              pending.resolve({
-                success: false,
-                error: "Task was cancelled",
-                taskId: resolvedTaskId,
-                durationMs: Date.now() - pending.startedAt,
-              });
+        // Only signed payload identity is trusted; headers cannot redirect an
+        // event to another task. The callback is a notification, not a result.
+        const resolvedTaskId = payload.task_id ?? payload.taskId;
+        const pending = typeof resolvedTaskId === "string" ? pendingTasks.get(resolvedTaskId) : undefined;
+        if (pending && !pending.settled) {
+          try {
+            const task = await pending.client.getTask(String(resolvedTaskId));
+            if (task.id !== resolvedTaskId) throw new Error("Canonical task ID mismatch");
+            if (!pending.settled) {
+              pending.status = task.status;
+              pending.progressPercent = task.progress_percent ?? pending.progressPercent;
+              pending.progressMessage = task.progress_message ?? pending.progressMessage;
+              if (["completed", "failed", "cancelled"].includes(task.status)) {
+                pending.settled = true;
+                pending.resolve({
+                  success: task.status === "completed",
+                  ...(task.status === "completed" ? { output: task.output } : {
+                    error: task.status === "cancelled" ? "Task was cancelled" : task.error_reason ?? "Task failed with no reason provided",
+                  }),
+                  taskId: task.id,
+                  durationMs: Date.now() - pending.startedAt,
+                });
+              }
             }
+          } catch {
+            res.writeHead(503);
+            res.end("Canonical task status unavailable");
+            return;
           }
         }
 
@@ -267,6 +250,7 @@ export async function startWebhookListener(
 
     server.listen(port, () => {
       webhookServer = server;
+      webhookListenerSecret = secret;
       // Start periodic cleanup of stale entries
       if (!staleCleanupTimer) {
         staleCleanupTimer = setInterval(sweepStaleTasks, STALE_TASK_CLEANUP_INTERVAL_MS);
@@ -297,6 +281,7 @@ export async function stopWebhookListener(): Promise<void> {
 
   const server = webhookServer;
   webhookServer = null;
+  webhookListenerSecret = null;
 
   // Force-close all active connections (Node 18.2+) so server.close() doesn't hang
   if ("closeAllConnections" in server && typeof server.closeAllConnections === "function") {
@@ -365,9 +350,9 @@ export async function deregisterWebhook(
 /**
  * Execute a task by submitting it to the Agrenting platform.
  *
- * Uses webhook callbacks when `webhookCallbackUrl` is configured in the adapter config
- * (or when `startWebhookListener()` has been called). Falls back to polling
- * when webhooks are not available.
+ * Uses authenticated webhook notifications when `webhookSecret` is configured.
+ * A callback URL without a signing secret uses polling. Canonical task reads
+ * authorize results; callback payloads never supply task output.
  *
  * When `maxPrice` is provided, the task is created with a budget and escrow funds
  * are locked via `createTaskPayment()` after submission.
@@ -386,6 +371,8 @@ export async function execute(
 ): Promise<AgrentingExecutionResult> {
   const client = new AgrentingClient(config);
   const startTime = Date.now();
+
+  if (config.webhookSecret?.trim()) await startWebhookListener(config);
 
   const provider = await client.getAgentProfile(config.agentDid);
 
@@ -430,7 +417,7 @@ export async function execute(
   // The taskRegistry in webhook-handler.ts is for the Paperclip-side webhook handler
   // (issue status updates), while pendingTasks below is for the in-process listener
   // (resolving execute() promises). They serve different purposes.
-  if (config.webhookCallbackUrl || config.webhookSecret) {
+  if (config.webhookSecret?.trim()) {
     registerTaskMapping(taskId, taskId, config.agrentingUrl, config);
     return executeWithWebhook(client, config, taskId, startTime);
   }
@@ -444,7 +431,7 @@ export async function execute(
  * Falls back to polling if no webhook received within the grace period.
  */
 async function executeWithWebhook(
-  _client: AgrentingClient,
+  client: AgrentingClient,
   config: AgrentingAdapterConfig,
   taskId: string,
   startTime: number
@@ -466,6 +453,7 @@ async function executeWithWebhook(
       startedAt: startTime,
       createdAt: Date.now(),
       settled: false,
+      client,
     });
   }).then((result) => {
     // Webhook resolved — abort any in-flight polling
@@ -473,38 +461,38 @@ async function executeWithWebhook(
     return result;
   });
 
-  // Race between webhook callback and timeout
+  let timeoutTimer: ReturnType<typeof setTimeout>;
+  let graceTimer: ReturnType<typeof setTimeout>;
   const timeout = new Promise<AgrentingExecutionResult>((resolve) => {
-    const ms = deadline - Date.now();
-    setTimeout(() => {
-      const entry = pendingTasks.get(taskId);
-      if (entry && !entry.settled) {
-        entry.settled = true;
-      }
-      resolve({
-        success: false,
-        error: `Task timed out after ${config.timeoutSec ?? 600}s`,
-        taskId,
-        durationMs: Date.now() - startTime,
-      });
-    }, Math.max(ms, 0));
+    timeoutTimer = setTimeout(() => resolve({
+      success: false,
+      error: `Task timed out after ${config.timeoutSec ?? 600}s`,
+      taskId,
+      durationMs: Date.now() - startTime,
+    }), Math.max(deadline - Date.now(), 0));
   });
-
-  // If webhook doesn't resolve within grace period, fall back to polling.
-  // Polling is deferred so it only starts when the timeout actually fires,
-  // avoiding wasted HTTP calls when the webhook wins.
-  return Promise.race([pending, timeout.then(async (result) => {
-    if (!result.success && result.error?.includes("timed out")) {
-      const pollingFallback = await pollTaskUntilDone({
-        config,
-        taskId,
-        deadline,
-        signal: abortController.signal,
-      });
-      return pollingFallback.result;
+  const polling = new Promise<void>((resolve) => {
+    graceTimer = setTimeout(resolve, getWebhookGracePeriodMs(config));
+  }).then(async () => {
+    try {
+      const result = await pollTaskUntilDone({ config, taskId, deadline, signal: abortController.signal });
+      return result.result;
+    } catch {
+      // A failed read does not fail the remote task. Keep authenticated
+      // callbacks and the original deadline active after polling is exhausted.
+      return pending;
     }
-    return result;
-  })]);
+  });
+  try {
+    return await Promise.race([pending, timeout, polling]);
+  } finally {
+    clearTimeout(timeoutTimer!);
+    clearTimeout(graceTimer!);
+    const entry = pendingTasks.get(taskId);
+    if (entry) entry.settled = true;
+    pendingTasks.delete(taskId);
+    abortController.abort();
+  }
 }
 
 /**
@@ -854,24 +842,12 @@ export async function autoSelectAgent(
   // Sort: availability first, then by specified sort criteria
   const sortBy = options.sortBy ?? "reputation_score";
 
-  // Prefer available agents if requested
-  if (options.preferAvailable ?? true) {
-    filtered.sort((a, b) => {
-      const aAvail =
-        (a.availability_status ?? a.availability ?? a.status) === "available"
-          ? 0
-          : 1;
-      const bAvail =
-        (b.availability_status ?? b.availability ?? b.status) === "available"
-          ? 0
-          : 1;
-      if (aAvail !== bAvail) return aAvail - bAvail;
-      return 0;
-    });
-  }
-
-  // Secondary sort
   filtered.sort((a, b) => {
+    if (options.preferAvailable ?? true) {
+      const aAvailable = (a.availability_status ?? a.availability ?? a.status) === "available";
+      const bAvailable = (b.availability_status ?? b.availability ?? b.status) === "available";
+      if (aAvailable !== bAvailable) return aAvailable ? -1 : 1;
+    }
     if (sortBy === "reputation_score") {
       const aReputation = Number(a.reputation_score ?? 0);
       const bReputation = Number(b.reputation_score ?? 0);

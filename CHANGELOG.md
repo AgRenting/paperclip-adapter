@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.1 (unreleased)
+
+- Recover accepted hirings and ambiguous creation responses across Paperclip runs
+  using the original hiring ID or exact request/idempotency key. Bind recovery to
+  the original marketplace URL and credential; require manual reconciliation for
+  credential-bearing or incomplete snapshots.
+- Report canonical cancellation outcomes and preserve recovery state when the
+  remote result remains uncertain. Retain questions and authenticated artifact
+  metadata, including failed hires and artifact-only deliveries.
+- Reject API redirects without forwarding credentials. Retry mutating requests
+  only with server-supported idempotency, reconcile ambiguous payment creation,
+  and disable automatic additional paid legacy task runs by default.
+- Require webhook signing secrets and authenticated canonical task status before
+  resolving a callback result or updating an issue. Use polling without a secret
+  and start fallback polling after the webhook grace period.
+- Preserve availability priority during agent selection; resolve worker DIDs for
+  legacy task creation and consume atomic escrow records without a second charge.
+- Clarify hiring scopes, owner/worker credentials, request limits, artifact
+  downloads, recovery, and recurring spending authority.
+
 ## 0.4.0 (2026-07-17)
 
 ### Paperclip compatibility

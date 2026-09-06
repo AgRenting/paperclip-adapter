@@ -410,6 +410,168 @@ describe("canonical Paperclip adapter", () => {
     expect(clientMocks.getHiring).not.toHaveBeenCalled();
   });
 
+  it("retains an accepted hiring and resumes it after a polling outage on a later run", async () => {
+    clientMocks.hireAgent.mockResolvedValue({
+      hiring: { id: "hiring-recover", status: "in_progress", price: "7.50" },
+    });
+    clientMocks.getHiring.mockRejectedValueOnce(new Error("Agrenting API 503: unavailable"));
+    const failed = await executePaperclip(executionContext());
+    expect(failed).toMatchObject({
+      exitCode: 1,
+      sessionDisplayId: "hiring-recover",
+      sessionParams: { hiringId: "hiring-recover", recoveryRequired: true },
+      resultJson: { hiringId: "hiring-recover", status: "in_progress" },
+    });
+
+    clientMocks.getHiring.mockResolvedValue({
+      id: "hiring-recover", status: "completed", price: "7.50",
+      task_output: { result: "Recovered original work" },
+    });
+    const next = executionContext();
+    next.runId = "run-456";
+    next.runtime.sessionParams = failed.sessionParams ?? null;
+    const recovered = await executePaperclip(next);
+    expect(recovered).toMatchObject({
+      exitCode: 0,
+      summary: "Recovered original work",
+      sessionParams: { hiringId: "hiring-recover", recoveryRequired: false },
+    });
+    expect(clientMocks.hireAgent).toHaveBeenCalledTimes(1);
+    expect(clientMocks.getAgentProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not create a replacement when recovery status cannot be read", async () => {
+    const ctx = executionContext();
+    ctx.runtime.sessionParams = { hiringId: "hiring-unknown", recoveryRequired: true };
+    clientMocks.getHiring.mockRejectedValue(new Error("Agrenting API 404: not found"));
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({
+      exitCode: 1,
+      sessionParams: { hiringId: "hiring-unknown", recoveryRequired: true },
+    });
+    expect(clientMocks.hireAgent).not.toHaveBeenCalled();
+  });
+
+  it("resumes active legacy sessions without another paid creation", async () => {
+    const ctx = executionContext();
+    ctx.runtime.sessionParams = { hiringId: "hiring-legacy" };
+    clientMocks.getHiring
+      .mockResolvedValueOnce({ id: "hiring-legacy", status: "in_progress", price: "7.50" })
+      .mockResolvedValue({ id: "hiring-legacy", status: "completed", price: "7.50", task_output: "Legacy result" });
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({ exitCode: 0, summary: "Legacy result" });
+    expect(clientMocks.hireAgent).not.toHaveBeenCalled();
+  });
+
+  it("allows a new heartbeat after the previous hiring was conclusively reported", async () => {
+    const ctx = executionContext();
+    ctx.runtime.sessionParams = { hiringId: "hiring-old", recoveryRequired: false };
+    clientMocks.hireAgent.mockResolvedValue({ hiring: { id: "hiring-new", status: "completed", price: "7.50", task_output: "New result" } });
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({ exitCode: 0, summary: "New result", sessionParams: { hiringId: "hiring-new", recoveryRequired: false } });
+    expect(clientMocks.hireAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks recovery when the configured marketplace origin changes", async () => {
+    const ctx = executionContext({ agrentingUrl: "https://other.example" });
+    ctx.runtime.sessionParams = { hiringId: "hiring-old", recoveryRequired: true, agrentingUrl: "https://agrenting.com" };
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({ exitCode: 1, sessionParams: { hiringId: "hiring-old", recoveryRequired: true } });
+    expect(clientMocks.getHiring).not.toHaveBeenCalled();
+    expect(clientMocks.hireAgent).not.toHaveBeenCalled();
+  });
+
+  it("keeps recovery required when neither cancellation nor reconciliation succeeds", async () => {
+    clientMocks.hireAgent.mockResolvedValue({ hiring: { id: "hiring-uncertain", status: "in_progress", price: "7.50" } });
+    clientMocks.cancelHiring.mockRejectedValue(new Error("Agrenting API 503: unavailable"));
+    clientMocks.getHiring.mockRejectedValue(new Error("Agrenting API 503: unavailable"));
+    let clock = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => { clock += 1000; return clock; });
+    try {
+      const result = await executePaperclip(executionContext({ timeoutSec: 1 }));
+      expect(result).toMatchObject({ timedOut: true, sessionParams: { hiringId: "hiring-uncertain", recoveryRequired: true }, resultJson: { status: "in_progress" } });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("binds a newly accepted hiring to its current origin after a completed session", async () => {
+    const ctx = executionContext({ agrentingUrl: "https://new-market.example" });
+    ctx.runtime.sessionParams = { hiringId: "hiring-old", recoveryRequired: false, agrentingUrl: "https://old-market.example" };
+    clientMocks.hireAgent.mockResolvedValue({ hiring: { id: "hiring-new", status: "in_progress", price: "7.50" } });
+    clientMocks.getHiring.mockRejectedValue(new Error("Agrenting API 503: unavailable"));
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({ sessionParams: { hiringId: "hiring-new", recoveryRequired: true, agrentingUrl: "https://new-market.example" } });
+  });
+
+  it("blocks automatic replay when task context contains a credential", async () => {
+    clientMocks.hireAgent.mockRejectedValue(new Error("Agrenting API 503: unavailable"));
+    const original = executionContext({}, { taskDescription: "Use ap_test for this request" });
+    const failed = await executePaperclip(original);
+    expect(failed).toMatchObject({ sessionParams: { recoveryRequired: true, pendingCreate: { idempotencyKey: "run-123", manualOnly: true } } });
+    expect(JSON.stringify(failed.sessionParams)).not.toContain("ap_test");
+    const next = executionContext();
+    next.runId = "new-run";
+    next.runtime.sessionParams = failed.sessionParams ?? null;
+    const result = await executePaperclip(next);
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "agrenting_hiring_reconciliation_required" });
+    expect(clientMocks.hireAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("never falls through to a new creation when a saved create replay conflicts", async () => {
+    clientMocks.hireAgent.mockRejectedValueOnce(new Error("Agrenting API 503: unavailable"));
+    const failed = await executePaperclip(executionContext());
+    const next = executionContext();
+    next.runId = "new-run";
+    next.runtime.sessionParams = failed.sessionParams ?? null;
+    clientMocks.hireAgent.mockRejectedValue(new Error("Agrenting API 409: idempotency conflict"));
+    const result = await executePaperclip(next);
+    expect(result).toMatchObject({ exitCode: 1, sessionParams: { recoveryRequired: true, pendingCreate: { idempotencyKey: "run-123" } } });
+    expect(clientMocks.getAgentProfile).toHaveBeenCalledTimes(1);
+    expect(clientMocks.hireAgent).toHaveBeenLastCalledWith(profile.did, expect.objectContaining({ clientIdempotencyKey: "run-123" }));
+  });
+
+  it("requires reconciliation if pending recovery state is incomplete", async () => {
+    const ctx = executionContext();
+    ctx.runtime.sessionParams = { recoveryRequired: true, pendingCreate: "invalid" };
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({ exitCode: 1, sessionParams: { recoveryRequired: true } });
+    expect(clientMocks.hireAgent).not.toHaveBeenCalled();
+  });
+
+  it("does not replay an ambiguous create using a different API credential", async () => {
+    clientMocks.hireAgent.mockRejectedValue(new Error("Agrenting API 503: unavailable"));
+    const failed = await executePaperclip(executionContext());
+    const next = executionContext({ apiKey: "different-api-key" });
+    next.runtime.sessionParams = failed.sessionParams ?? null;
+    const result = await executePaperclip(next);
+    expect(result).toMatchObject({ exitCode: 1, sessionParams: { recoveryRequired: true } });
+    expect(clientMocks.hireAgent).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a terminal legacy session once without another hiring or duplicate cost", async () => {
+    const ctx = executionContext();
+    ctx.runtime.sessionParams = { hiringId: "legacy-completed" };
+    clientMocks.getHiring.mockResolvedValue({ id: "legacy-completed", status: "completed", price: "7.50", task_output: "Old result" });
+    const result = await executePaperclip(ctx);
+    expect(result).toMatchObject({ exitCode: 0, summary: "Old result", costUsd: null, sessionParams: { hiringId: "legacy-completed", recoveryRequired: false } });
+    expect(clientMocks.hireAgent).not.toHaveBeenCalled();
+  });
+
+  it("logs the actual terminal state returned by cancellation", async () => {
+    clientMocks.hireAgent.mockResolvedValue({ hiring: { id: "hiring-race-return", status: "in_progress", price: "7.50" } });
+    clientMocks.cancelHiring.mockResolvedValue({ id: "hiring-race-return", status: "completed", price: "7.50", task_output: "Completed during cancellation" });
+    let clock = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => { clock += 1000; return clock; });
+    const ctx = executionContext({ timeoutSec: 1 });
+    try {
+      const result = await executePaperclip(ctx);
+      expect(result.exitCode).toBe(0);
+      expect(vi.mocked(ctx.onLog).mock.calls.flat().join(" ")).not.toContain("was cancelled");
+      expect(vi.mocked(ctx.onLog).mock.calls.flat().join(" ")).toContain("completed");
+    } finally { nowSpy.mockRestore(); }
+  });
+
   it("best-effort cancels a hiring when its Paperclip run times out", async () => {
     clientMocks.hireAgent.mockResolvedValue({
       hiring: { id: "hiring-timeout", status: "in_progress" },
@@ -421,6 +583,7 @@ describe("canonical Paperclip adapter", () => {
         hiringId: "hiring-timeout",
       },
     });
+    clientMocks.cancelHiring.mockResolvedValue({ id: "hiring-timeout", status: "cancelled" });
     let clock = 0;
     const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
       clock += 1_000;
@@ -434,9 +597,10 @@ describe("canonical Paperclip adapter", () => {
     nowSpy.mockRestore();
     expect(clientMocks.cancelHiring).toHaveBeenCalledWith("hiring-timeout");
     expect(result).toMatchObject({
-      exitCode: null,
-      timedOut: true,
-      errorCode: "agrenting_hiring_timeout",
+      exitCode: 1,
+      timedOut: false,
+      errorCode: "agrenting_hiring_cancelled",
+      resultJson: { status: "cancelled" },
       sessionParams: { hiringId: "hiring-timeout" },
     });
   });

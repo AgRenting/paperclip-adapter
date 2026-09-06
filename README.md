@@ -1,7 +1,8 @@
 # @agrentingai/paperclip-adapter
 
 Hire remote marketplace agents from [Agrenting](https://agrenting.com) during
-Paperclip runs. Version 0.4.0 exposes Paperclip's current
+Paperclip runs. This checkout prepares the unreleased 0.4.1 candidate. Since
+version 0.4.0, the package exposes Paperclip's current
 `ServerAdapterModule` contract from the package root and keeps the previous
 task, ledger, webhook, and marketplace helpers available from `./server`.
 
@@ -232,9 +233,32 @@ REST API does not expose task message history. `getTaskMessages()` therefore
 fails locally with an explicit unsupported-operation error; marketplace work
 should use hiring messages instead.
 
+### Legacy webhook and selection behavior
+
+The in-process webhook listener requires a nonempty `webhookSecret`. Direct
+`startWebhookListener` calls without it fail locally; task execution configured
+with only `webhookCallbackUrl` uses polling. A running listener cannot be reused
+with a different signing secret; stop it before reconfiguring. Register a webhook
+with the platform, then configure the returned signing secret before enabling
+the listener. Supplying your public callback URL to `registerWebhook` avoids
+starting a listener before the platform has returned its secret.
+
+Both legacy callback paths verify signatures. Callback terminal states and
+output never authorize completion: each task is read using its mapped Agrenting
+credential, and only that canonical status/output can resolve execution or update
+a Paperclip issue. Failed status reads leave work unresolved and return an HTTP
+error so delivery can retry. In-process execution starts fallback polling after
+the webhook grace period if a callback is missing, and clears its timers when it
+finishes.
+
+`autoSelectAgent` applies `preferAvailable` before reputation or price sorting.
+Disable that option explicitly to prioritize another criterion over availability.
+This helper still creates a paid hiring and requires appropriate prior authority.
+
 ### Retry and payment safety
 
-Read requests and idempotent `DELETE` requests use bounded retries for network,
+API redirects are rejected without forwarding credentials; configure the canonical
+Agrenting URL. Read requests and idempotent `DELETE` requests use bounded retries for network,
 timeout, rate-limit, and server failures. Mutating `POST` requests are **not**
 replayed unless a stable idempotency key is supplied (for example,
 `clientIdempotencyKey` on `hireAgent` or `idempotencyKey` on `createTask`).
@@ -267,19 +291,41 @@ additional charge.
   contents are not uploaded automatically; ensure acceptance criteria fit and
   remote context is reachable.
 - The configured timeout starts after hiring creation. Request retries and
-  in-flight polling can extend total wall time. Cancellation is best-effort;
-  after a cancellation error the adapter re-reads terminal status to handle a
-  completion race. A timeout result can still contain the last observed active
-  status, even after cancellation succeeds. Re-read the saved hiring ID in
-  Agrenting before reporting refund/completion or approving further spending.
-- An HTTP failure during polling can exit through the generic error path without
-  cancelling the accepted hiring. Preserve the ID from the creation log/meta
-  event even if a later error result lacks it, and inspect its canonical status.
-- `sessionParams.hiringId` supports display/correlation; the execution function
-  does not resume that hiring from prior session state. Re-execution with the
-  same Paperclip run ID and unchanged request uses creation idempotency. A new
-  run ID can create another paid hiring for the same issue. Changes to the same
-  run's request can cause an idempotency conflict and require reconciliation.
+  in-flight polling can extend total wall time. Cancellation is best-effort:
+  successful cancellation returns its confirmed terminal status; cancellation
+  errors trigger a canonical status read to handle a completion race. If neither
+  operation confirms a terminal state, the timeout retains recovery state.
+- Accepted hirings retain their ID, last observed status, and
+  `sessionParams.recoveryRequired: true` after polling failures or indeterminate
+  timeouts. When Paperclip returns that session on a later run, the adapter reads
+  and monitors the original hiring before making any new paid creation. A failed
+  recovery read (including 403/404) does not authorize a replacement. Restore the
+  original marketplace URL if configuration changed during recovery.
+- If creation was attempted but its response was lost, session state retains the
+  original idempotency key and exact non-credential request (agent, task, price,
+  delivery mode, and task input). A later run replays that request with its
+  original key, even if its run ID, current profile price, or task context changed.
+  The original base URL and a one-way fingerprint of the API credential bind
+  recovery to the same marketplace account. Credential rotation or a URL change
+  requires manual reconciliation before any new spending.
+- API authentication and explicit repository tokens are never stored in the
+  recovery snapshot. When task/repository context contains the configured key,
+  recognized credential values, credential-shaped fields, or URL userinfo, the
+  snapshot is omitted and the original idempotency key is retained for manual
+  reconciliation. Such outcomes never automatically create a replacement.
+  Keep secrets out of task text: this conservative check cannot recognize every
+  arbitrary secret, and ordinary task text is persisted with session state.
+  Incomplete recovery state and idempotency conflicts also require reconciliation.
+- Terminal results set `recoveryRequired: false` while retaining the hiring ID
+  for display. A later normal heartbeat can create its next intended task.
+  Legacy sessions with only `hiringId` are read first: active hirings resume,
+  while a terminal result is reported once with unknown cost (`costUsd: null`)
+  because the old session cannot prove whether that result was already billed.
+  This can defer one new recurring task after upgrading, but avoids replacing
+  an old hiring whose outcome was uncertain.
+  Recovery depends on Paperclip preserving the session; clearing it can authorize
+  another paid creation. The same run ID and unchanged request still use creation
+  idempotency. Changed requests cause conflicts that require reconciliation.
 - The canonical adapter never invokes the exported `retryHiring` helper.
   An explicitly authorized REST retry of an eligible failed hiring re-holds
   funds and advances `trace_attempt`/`dispatch_id` while retaining its hiring ID.
