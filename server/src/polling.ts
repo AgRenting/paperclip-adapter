@@ -149,6 +149,30 @@ export async function pollTaskUntilDone(
   }
 
   // Max polls reached without terminal state — do one final check
+  if (options.signal?.aborted) {
+    return {
+      result: {
+        success: false,
+        error: "Polling aborted",
+        taskId: options.taskId,
+        durationMs: Date.now() - startTime,
+      },
+      pollCount: pollAttempt,
+      viaPolling: true,
+    };
+  }
+  if (Date.now() >= options.deadline) {
+    return {
+      result: {
+        success: false,
+        error: `Task timed out after ${options.config.timeoutSec ?? 600}s`,
+        taskId: options.taskId,
+        durationMs: Date.now() - startTime,
+      },
+      pollCount: pollAttempt,
+      viaPolling: true,
+    };
+  }
   const finalTask = await client.getTask(options.taskId);
   if (finalTask.status === "completed") {
     return {

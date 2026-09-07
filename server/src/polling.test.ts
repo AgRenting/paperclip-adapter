@@ -1,4 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { AgrentingClient } from "./client.js";
 import {
   pollTaskUntilDone,
   getBackoffMs,
@@ -36,6 +37,10 @@ const mockConfig = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 // ---------------------------------------------------------------------------
@@ -106,6 +111,93 @@ describe("getWebhookGracePeriodMs", () => {
 // ---------------------------------------------------------------------------
 
 describe("pollTaskUntilDone", () => {
+  for (const boundary of ["deadline", "abort"] as const) {
+    it(`does not read a resumed max-poll task after ${boundary}`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+      const controller = new AbortController();
+      if (boundary === "abort") controller.abort();
+      const getTask = vi.fn();
+      vi.mocked(AgrentingClient).mockImplementationOnce(function() {
+        return { getTask };
+      });
+
+      const result = await pollTaskUntilDone({
+        config: mockConfig,
+        taskId: "task-resumed",
+        startAttempt: MAX_POLLS,
+        deadline: Date.now() + (boundary === "deadline" ? 0 : 600_000),
+        signal: controller.signal,
+      });
+
+      expect(getTask).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        result: {
+          success: false,
+          taskId: "task-resumed",
+          error: boundary === "abort" ? "Polling aborted" : "Task timed out after 600s",
+        },
+        pollCount: MAX_POLLS,
+      });
+    });
+  }
+
+  it("retains the final reconciliation read while the deadline and signal permit it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const getTask = vi.fn().mockResolvedValue({ id: "task-final", status: "completed", output: "done" });
+    vi.mocked(AgrentingClient).mockImplementationOnce(function() {
+      return { getTask };
+    });
+
+    const result = await pollTaskUntilDone({
+      config: mockConfig,
+      taskId: "task-final",
+      startAttempt: MAX_POLLS,
+      deadline: Date.now() + 600_000,
+      signal: new AbortController().signal,
+    });
+
+    expect(getTask).toHaveBeenCalledExactlyOnceWith("task-final");
+    expect(result).toMatchObject({
+      result: { success: true, taskId: "task-final", output: "done" },
+      pollCount: MAX_POLLS + 1,
+    });
+  });
+
+  for (const boundary of ["deadline", "abort"] as const) {
+    it(`does not make the final read when ${boundary} occurs on the last poll`, async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+      const controller = new AbortController();
+      const deadline = Date.now() + 200_000;
+      const getTask = vi.fn();
+      vi.mocked(AgrentingClient).mockImplementationOnce(function() {
+        return { getTask };
+      });
+      getTask.mockImplementation(async () => {
+        if (boundary === "deadline") vi.setSystemTime(deadline);
+        else controller.abort();
+        return {
+          id: "task-last", status: "in_progress", client_agent_id: "c1",
+          provider_agent_id: "p1", capability: "test", input: "hello",
+          created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+        };
+      });
+      const running = pollTaskUntilDone({
+        config: mockConfig, taskId: "task-last", startAttempt: MAX_POLLS - 1,
+        deadline, signal: controller.signal,
+      });
+      await vi.advanceTimersByTimeAsync(120_000);
+      const result = await running;
+      expect(getTask).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({
+        result: { success: false, taskId: "task-last", error: boundary === "abort" ? "Polling aborted" : "Task timed out after 600s" },
+        pollCount: MAX_POLLS,
+      });
+    });
+  }
+
   it("returns completed task on first poll", { timeout: 30_000 }, async () => {
     const result = await pollTaskUntilDone({
       config: mockConfig,
