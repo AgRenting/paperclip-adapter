@@ -117,7 +117,11 @@ describe("pollTaskUntilDone", () => {
       vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
       const controller = new AbortController();
       if (boundary === "abort") controller.abort();
-      const getTask = vi.fn();
+      const getTask = vi.fn().mockResolvedValue({
+        id: "task-resumed", status: "in_progress", client_agent_id: "c1",
+        provider_agent_id: "p1", capability: "test", input: "hello",
+        created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+      });
       vi.mocked(AgrentingClient).mockImplementationOnce(function() {
         return { getTask };
       });
