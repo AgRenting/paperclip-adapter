@@ -23,6 +23,7 @@ import type {
   SwarmCreateBody,
   SwarmLeadBody,
   SwarmMemberBody,
+  SwarmCreateFailure,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -745,6 +746,48 @@ export function swarmRequestFromRecovery(pending: Record<string, unknown>): Swar
   ]);
   if (Object.keys(request).some((field) => !allowed.has(field))) return null;
   return request as unknown as SwarmCreateBody;
+}
+
+
+export const SWARM_REPLAY_WINDOW_MS = 30 * 60 * 1_000;
+
+/** True only within 30 minutes (inclusive) after the first create attempt. */
+export function swarmReplayAllowed(createdAt: unknown, now: Date): boolean {
+  const started = typeof createdAt === "string" ? Date.parse(createdAt) : Number.NaN;
+  if (!Number.isFinite(started)) return false;
+  const elapsed = now.getTime() - started;
+  return elapsed >= 0 && elapsed <= SWARM_REPLAY_WINDOW_MS;
+}
+
+/** Sorts a failed POST /api/v1/swarms into definitive, conflict or ambiguous (15.4). */
+export function classifySwarmCreateError(error: unknown): SwarmCreateFailure {
+  const facts = asRecord(error) ?? {};
+  const message = error instanceof Error ? error.message : String(error);
+  const httpStatus = typeof facts.status === "number" ? facts.status : null;
+  const code = typeof facts.code === "string" ? facts.code : null;
+  if (httpStatus === null || [408, 425, 429].includes(httpStatus) || httpStatus >= 500) {
+    return { kind: "ambiguous", message };
+  }
+  if (httpStatus === 409 && code === "IDEMPOTENCY_CONFLICT") return { kind: "conflict", message };
+  return {
+    kind: "definitive",
+    httpStatus,
+    code,
+    message: typeof facts.apiMessage === "string" ? facts.apiMessage : message,
+    details: Array.isArray(facts.details) ? facts.details : [],
+  };
+}
+
+/** A single-hire session that must be finished before team mode may spend. */
+export function hiringRecoveryPending(prior: Record<string, unknown>): boolean {
+  if (prior.mode === "swarm") return false;
+  if (prior.recoveryRequired === true) return true;
+  return prior.recoveryRequired !== false && nonEmpty(prior.hiringId) !== null;
+}
+
+/** A team session that must be finished before hiring mode may spend. */
+export function swarmRecoveryPending(prior: Record<string, unknown>): boolean {
+  return prior.mode === "swarm" && prior.recoveryRequired === true;
 }
 
 function summarizeChecks(
