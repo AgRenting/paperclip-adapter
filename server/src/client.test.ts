@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { AgrentingClient } from "./client.js";
+import type { SwarmCreateBody } from "./types.js";
 
 const mockConfig = {
   agrentingUrl: "https://api.agrenting.com",
@@ -1208,5 +1209,92 @@ describe("AgrentingClient", () => {
         expect.objectContaining({ method: "GET" })
       );
     });
+  });
+});
+
+describe("AgrentingClient team routes", () => {
+  const body: SwarmCreateBody = {
+    task_description: "Harden auth",
+    delivery_mode: "output",
+    client_idempotency_key: "run-123",
+    total_price: "45.00",
+    saved_team_id: "team-1",
+  };
+
+  it("POSTs a team wrapped in swarm with the idempotency header", async () => {
+    const fn = mockFetchResponse(201, { data: { swarm_id: "swarm-1", status: "planning", final: false } });
+    const client = new AgrentingClient(mockConfig);
+
+    expect((await client.createSwarm(body)).swarm_id).toBe("swarm-1");
+    expect(fn).toHaveBeenCalledWith(
+      "https://api.agrenting.com/api/v1/swarms",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({ "X-Idempotency-Key": "run-123", "X-API-Key": "test-api-key" }),
+      })
+    );
+    expect(JSON.parse(fn.mock.calls[0][1].body)).toEqual({ swarm: body });
+  });
+
+  it("GETs a team and the saved teams", async () => {
+    const client = new AgrentingClient(mockConfig);
+    const swarmFn = mockFetchResponse(200, { data: { swarm_id: "swarm-1", status: "running", final: false } });
+    await client.getSwarm("swarm-1");
+    expect(swarmFn).toHaveBeenCalledWith(
+      "https://api.agrenting.com/api/v1/swarms/swarm-1",
+      expect.objectContaining({ method: "GET" })
+    );
+
+    const teamsFn = mockFetchResponse(200, {
+      data: [{ id: "team-1", name: "Auth crew", total_price: "45.00", lead: {}, members: [] }],
+    });
+    expect(await client.listSavedTeams()).toHaveLength(1);
+    expect(teamsFn).toHaveBeenCalledWith(
+      "https://api.agrenting.com/api/v1/saved_teams",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("GETs one team listing", async () => {
+    const fn = mockFetchResponse(200, {
+      data: { id: "listing-1", slug: "auth-crew", name: "Auth crew", total_price: "45.00", agent_count: 3, available: true },
+    });
+    const client = new AgrentingClient(mockConfig);
+
+    expect((await client.getTeamListing("listing-1")).total_price).toBe("45.00");
+    expect(fn).toHaveBeenCalledTimes(1);
+    expect(fn).toHaveBeenCalledWith(
+      "https://api.agrenting.com/api/v1/team_listings/listing-1",
+      expect.objectContaining({ method: "GET" })
+    );
+  });
+
+  it("keeps the envelope code, message and details of a refused create", async () => {
+    const fn = mockFetchResponse(409, {
+      data: null,
+      errors: [{
+        code: "AGENT_BUSY",
+        message: "One or more agents are busy. Remove them or try again later.",
+        details: [{ slot: "members[0]", agent_did: "did:agrenting:reviewer", code: "agent_busy" }],
+      }],
+    });
+    const client = new AgrentingClient(mockConfig);
+
+    await expect(client.createSwarm(body)).rejects.toMatchObject({
+      status: 409,
+      code: "AGENT_BUSY",
+      apiMessage: "One or more agents are busy. Remove them or try again later.",
+      details: [{ slot: "members[0]", agent_did: "did:agrenting:reviewer", code: "agent_busy" }],
+    });
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores a non-JSON error body", async () => {
+    mockFetchResponse(422, "Invalid");
+    const client = new AgrentingClient(mockConfig);
+
+    const error: unknown = await client.createSwarm(body).catch((caught: unknown) => caught);
+    expect(error).toMatchObject({ status: 422 });
+    expect((error as { code?: unknown }).code).toBeUndefined();
   });
 });
