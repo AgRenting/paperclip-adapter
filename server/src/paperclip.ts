@@ -17,6 +17,9 @@ import type {
   HiringArtifact,
   HiringQuestion,
   HireAgentOptions,
+  SwarmModeConfig,
+  SwarmRoster,
+  SwarmRosterSlot,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -556,6 +559,120 @@ export async function executePaperclip(
       } : {}),
     };
   }
+}
+
+// ── Team (swarm) mode ─────────────────────────────────────────────
+
+export const DEFAULT_SWARM_CREATE_WAKE_REASONS: readonly string[] = ["issue_assigned", "issue_commented"];
+const MAX_SWARM_MEMBERS = 8;
+const MAX_SWARM_NOTE_LENGTH = 500;
+
+/** Parses a USD amount ("45", "45.5", "45.50" or a number) into integer cents. */
+export function priceToCents(value: unknown): number | null {
+  const text = typeof value === "number"
+    ? (Number.isFinite(value) ? String(value) : "")
+    : typeof value === "string" ? value.trim() : "";
+  const match = /^(\d{1,9})(?:\.(\d{1,2}))?$/.exec(text);
+  if (!match) return null;
+  return Number(match[1]) * 100 + Number((match[2] ?? "").padEnd(2, "0"));
+}
+
+export function centsToPrice(cents: number): string {
+  return `${Math.floor(cents / 100)}.${String(cents % 100).padStart(2, "0")}`;
+}
+
+function swarmSlotFrom(raw: unknown, label: string): SwarmRosterSlot | string {
+  const slot = asRecord(raw);
+  if (!slot) return `${label} must be an object with agentDid, capability and price.`;
+  const agentDid = nonEmpty(slot.agentDid);
+  if (!agentDid) return `${label}.agentDid is required.`;
+  const capability = nonEmpty(slot.capability);
+  if (!capability) return `${label}.capability is required.`;
+  const cents = priceToCents(slot.price);
+  if (cents === null) return `${label}.price must be a USD amount such as "15.00".`;
+  if (slot.note !== undefined &&
+      (typeof slot.note !== "string" || slot.note.length > MAX_SWARM_NOTE_LENGTH)) {
+    return `${label}.note must be text of at most 500 characters.`;
+  }
+  const note = nonEmpty(slot.note);
+  return { agentDid, capability, price: centsToPrice(cents), ...(note ? { note } : {}) };
+}
+
+function swarmRosterFrom(raw: unknown): SwarmRoster | string {
+  let value = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return "roster must be valid JSON.";
+    }
+  }
+  const roster = asRecord(value);
+  if (!roster) return "roster must be an object with lead and members.";
+  const lead = swarmSlotFrom(roster.lead, "roster.lead");
+  if (typeof lead === "string") return lead;
+  if (!Array.isArray(roster.members) || roster.members.length < 1 ||
+      roster.members.length > MAX_SWARM_MEMBERS) {
+    return "roster.members must list 1 to 8 members.";
+  }
+  const members: SwarmRosterSlot[] = [];
+  for (const [index, entry] of roster.members.entries()) {
+    const member = swarmSlotFrom(entry, `roster.members[${index}]`);
+    if (typeof member === "string") return member;
+    members.push(member);
+  }
+  return { lead, members };
+}
+
+function wakeReasonsFrom(raw: unknown): string[] {
+  const list: unknown[] = Array.isArray(raw) ? raw : typeof raw === "string" ? raw.split(",") : [];
+  const reasons = list
+    .map((entry) => nonEmpty(entry))
+    .filter((entry): entry is string => entry !== null);
+  return reasons.length > 0 ? reasons : [...DEFAULT_SWARM_CREATE_WAKE_REASONS];
+}
+
+/** Validates team-mode config. Returns the first problem as an exact sentence. */
+export function swarmConfigFrom(
+  raw: Record<string, unknown>
+): { ok: true; value: SwarmModeConfig } | { ok: false; error: string } {
+  const hasRoster = raw.roster !== undefined && raw.roster !== null &&
+    !(typeof raw.roster === "string" && raw.roster.trim() === "");
+  const savedTeamId = nonEmpty(raw.savedTeamId);
+  const teamListingId = nonEmpty(raw.teamListingId);
+  if ([hasRoster, savedTeamId !== null, teamListingId !== null].filter(Boolean).length !== 1) {
+    return { ok: false, error: "Swarm mode requires exactly one of roster, savedTeamId or teamListingId." };
+  }
+  const maxTotalPriceCents = priceToCents(raw.maxTotalPrice);
+  if (!maxTotalPriceCents) {
+    return { ok: false, error: 'Swarm mode requires maxTotalPrice, a USD amount such as "60.00".' };
+  }
+  let roster: SwarmRoster | null = null;
+  if (hasRoster) {
+    const parsed = swarmRosterFrom(raw.roster);
+    if (typeof parsed === "string") return { ok: false, error: parsed };
+    roster = parsed;
+  }
+  return {
+    ok: true,
+    value: {
+      roster,
+      savedTeamId,
+      teamListingId,
+      maxTotalPriceCents,
+      swarmCreateWakeReasons: wakeReasonsFrom(raw.swarmCreateWakeReasons),
+    },
+  };
+}
+
+/** The run's wake reason: context.wakeReason, else context.paperclipWake.reason. */
+export function swarmWakeReasonFrom(context: Record<string, unknown>): string | null {
+  return nonEmpty(context.wakeReason) ?? nonEmpty(asRecord(context.paperclipWake)?.reason);
+}
+
+/** True only when the wake reason is in the configured create list (15.5). */
+export function swarmCreateAllowed(reason: string | null, allowed: readonly string[]): boolean {
+  return reason !== null && allowed.includes(reason);
 }
 
 function summarizeChecks(
