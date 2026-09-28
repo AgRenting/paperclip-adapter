@@ -1303,12 +1303,66 @@ function summarizeChecks(
   return "pass";
 }
 
+async function swarmEnvironmentChecks(
+  client: AgrentingClient,
+  swarm: SwarmModeConfig,
+  checks: AdapterEnvironmentCheck[]
+): Promise<void> {
+  const max = centsToPrice(swarm.maxTotalPriceCents);
+  if (swarm.roster) {
+    const { totalCents } = swarmRosterBody(swarm.roster);
+    const total = centsToPrice(totalCents);
+    checks.push(totalCents > swarm.maxTotalPriceCents
+      ? { code: "agrenting_swarm_over_budget", level: "error", message: `Team total ${total} exceeds maxTotalPrice ${max}.` }
+      : { code: "agrenting_swarm_roster_ok", level: "info",
+          message: `Team roster: 1 lead and ${swarm.roster.members.length} members, total ${total} of maxTotalPrice ${max}.` });
+    return;
+  }
+  if (swarm.teamListingId) {
+    try {
+      const listing = await client.getTeamListing(swarm.teamListingId);
+      const cents = priceToCents(listing.total_price) ?? Number.POSITIVE_INFINITY;
+      checks.push(cents > swarm.maxTotalPriceCents
+        ? { code: "agrenting_swarm_over_budget", level: "error",
+            message: `Team listing ${listing.name} costs ${listing.total_price}, above maxTotalPrice ${max}.` }
+        : { code: "agrenting_team_listing_ok", level: "info",
+            message: `Found team listing ${listing.name} (${listing.id}); current total ${listing.total_price}.` });
+    } catch (error) {
+      checks.push(asRecord(error)?.status === 404
+        ? { code: "agrenting_team_listing_missing", level: "error",
+            message: `Team listing ${swarm.teamListingId} was not found for this API key.` }
+        : { code: "agrenting_team_listing_failed", level: "error", message: "Could not read the team listing.",
+            detail: error instanceof Error ? error.message : String(error) });
+    }
+    return;
+  }
+  try {
+    const team = (await client.listSavedTeams()).find((entry) => entry.id === swarm.savedTeamId);
+    if (!team) {
+      checks.push({ code: "agrenting_saved_team_missing", level: "error",
+        message: `Saved team ${swarm.savedTeamId} was not found for this API key.` });
+      return;
+    }
+    const cents = priceToCents(team.total_price) ?? Number.POSITIVE_INFINITY;
+    checks.push(cents > swarm.maxTotalPriceCents
+      ? { code: "agrenting_swarm_over_budget", level: "error",
+          message: `Saved team ${team.name} costs ${team.total_price}, above maxTotalPrice ${max}.` }
+      : { code: "agrenting_saved_team_ok", level: "info",
+          message: `Found saved team ${team.name} (${team.id}); current total ${team.total_price}.` });
+  } catch (error) {
+    checks.push({ code: "agrenting_saved_team_failed", level: "error", message: "Could not list saved teams.",
+      detail: error instanceof Error ? error.message : String(error) });
+  }
+}
+
 /** Canonical structured environment test used by Paperclip. */
 export async function testPaperclipEnvironment(
   ctx: AdapterEnvironmentTestContext
 ): Promise<AdapterEnvironmentTestResult> {
   const config = configFrom(ctx.config);
   const checks: AdapterEnvironmentCheck[] = [];
+  const swarmMode = ctx.config.mode === "swarm";
+  const swarmConfig = swarmMode ? swarmConfigFrom(ctx.config) : null;
 
   let parsedUrl: URL | null = null;
   try {
@@ -1334,12 +1388,15 @@ export async function testPaperclipEnvironment(
       hint: "Create an ap_... token in Agrenting and store it as a Paperclip secret.",
     });
   }
-  if (!config.agentDid) {
+  if (!swarmMode && !config.agentDid) {
     checks.push({
       code: "agrenting_agent_did_missing",
       level: "error",
       message: "Agrenting requires agentDid.",
     });
+  }
+  if (swarmConfig && !swarmConfig.ok) {
+    checks.push({ code: "agrenting_swarm_config_invalid", level: "error", message: swarmConfig.error });
   }
 
   if (!checks.some((check) => check.level === "error")) {
@@ -1362,21 +1419,25 @@ export async function testPaperclipEnvironment(
       });
     }
     if (connectionOk) {
-      try {
-        const profile = await client.getAgentProfile(config.agentDid);
-        checks.push({
-          code: "agrenting_agent_profile_ok",
-          level: "info",
-          message: `Found Agrenting agent ${profile.name} (${profile.did}).`,
-          detail: `${profile.capabilities.length} capabilities; base price ${profile.base_price ?? "not reported"}.`,
-        });
-      } catch (error) {
-        checks.push({
-          code: "agrenting_agent_profile_failed",
-          level: "error",
-          message: `Could not load Agrenting agent ${config.agentDid}.`,
-          detail: error instanceof Error ? error.message : String(error),
-        });
+      if (swarmConfig?.ok) {
+        await swarmEnvironmentChecks(client, swarmConfig.value, checks);
+      } else {
+        try {
+          const profile = await client.getAgentProfile(config.agentDid);
+          checks.push({
+            code: "agrenting_agent_profile_ok",
+            level: "info",
+            message: `Found Agrenting agent ${profile.name} (${profile.did}).`,
+            detail: `${profile.capabilities.length} capabilities; base price ${profile.base_price ?? "not reported"}.`,
+          });
+        } catch (error) {
+          checks.push({
+            code: "agrenting_agent_profile_failed",
+            level: "error",
+            message: `Could not load Agrenting agent ${config.agentDid}.`,
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
       }
     }
   }
