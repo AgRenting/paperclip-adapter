@@ -19,6 +19,10 @@ import type {
   HiringMessage,
   Capability,
   RetryHiringOptions,
+  SavedTeam,
+  SwarmCreateBody,
+  SwarmStatus,
+  TeamListing,
 } from "./types.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -34,13 +38,42 @@ interface RequestOptions {
   idempotencyKey?: string;
 }
 
+interface ApiErrorFacts {
+  code?: string;
+  apiMessage?: string;
+  details?: unknown[];
+}
+
+/** Reads {"errors": [{"code", "message", "details"}]} from an error body; {} when absent or not JSON. */
+function apiErrorFacts(text: string): ApiErrorFacts {
+  try {
+    const parsed = JSON.parse(text) as { errors?: unknown };
+    const first = Array.isArray(parsed.errors) ? parsed.errors[0] : null;
+    if (typeof first !== "object" || first === null) return {};
+    const error = first as Record<string, unknown>;
+    return {
+      ...(typeof error.code === "string" ? { code: error.code } : {}),
+      ...(typeof error.message === "string" ? { apiMessage: error.message } : {}),
+      ...(Array.isArray(error.details) ? { details: error.details } : {}),
+    };
+  } catch {
+    return {};
+  }
+}
+
 class NonRetryableAgrentingError extends Error {
   readonly status?: number;
+  readonly code?: string;
+  readonly apiMessage?: string;
+  readonly details?: unknown[];
 
-  constructor(message: string, status?: number) {
+  constructor(message: string, status?: number, facts: ApiErrorFacts = {}) {
     super(message);
     this.name = "NonRetryableAgrentingError";
     this.status = status;
+    this.code = facts.code;
+    this.apiMessage = facts.apiMessage;
+    this.details = facts.details;
   }
 }
 
@@ -133,7 +166,8 @@ export class AgrentingClient {
 
           throw new NonRetryableAgrentingError(
             `Agrenting API ${response.status}: ${text.slice(0, 500)}`,
-            response.status
+            response.status,
+            apiErrorFacts(text)
           );
         }
 
@@ -674,6 +708,40 @@ export class AgrentingClient {
     return this.request<Hiring>(
       "POST",
       `/api/v1/hirings/${hiringId}/cancel`
+    );
+  }
+
+  /** Create a team (lead + members, a saved team or a listed team).
+   * POST /api/v1/swarms with body {swarm: body}. The key makes the retry loop
+   * replay only with Agrenting-side idempotency.
+   */
+  async createSwarm(body: SwarmCreateBody): Promise<SwarmStatus> {
+    return this.request<SwarmStatus>(
+      "POST",
+      "/api/v1/swarms",
+      { swarm: body },
+      { idempotencyKey: body.client_idempotency_key }
+    );
+  }
+
+  /** Read a team's status. GET /api/v1/swarms/:id */
+  async getSwarm(swarmId: string): Promise<SwarmStatus> {
+    return this.request<SwarmStatus>(
+      "GET",
+      `/api/v1/swarms/${encodeURIComponent(swarmId)}`
+    );
+  }
+
+  /** List the key owner's saved teams. GET /api/v1/saved_teams */
+  async listSavedTeams(): Promise<SavedTeam[]> {
+    return this.request<SavedTeam[]>("GET", "/api/v1/saved_teams");
+  }
+
+  /** Read one listed team by id. GET /api/v1/team_listings/:id */
+  async getTeamListing(id: string): Promise<TeamListing> {
+    return this.request<TeamListing>(
+      "GET",
+      `/api/v1/team_listings/${encodeURIComponent(id)}`
     );
   }
 
