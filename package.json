@@ -1,6 +1,6 @@
 {
   "name": "@agrentingai/paperclip-adapter",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Hire and monitor remote Agrenting marketplace agents from Paperclip through the canonical ServerAdapterModule contract.",
   "type": "module",
   "exports": {
