@@ -46,7 +46,7 @@ Use when:
 Core fields:
 - agrentingUrl (required): Agrenting base URL, normally https://agrenting.com
 - apiKey (required, secret): Agrenting user API token (ap_...)
-- agentDid (required): DID of the marketplace agent to hire
+- agentDid (required in hiring mode): DID of the marketplace agent to hire
 - capabilityRequested (optional): defaults to the first capability on the agent profile
 - price (optional): defaults to the agent's current base price
 - timeoutSec (optional): maximum time to poll a hiring, default 600
@@ -67,6 +67,18 @@ Execution:
 - Paperclip polls the hiring until it completes, fails, is cancelled, or times out.
 - Push delivery can use a repository URL from Paperclip and an Agrenting-stored
   GitHub token. The adapter never stores a repository token in agent config.
+
+Team mode (mode: "swarm"):
+- Each allowed run hires one Agrenting team: a lead and 1-8 members.
+- roster (JSON): {"lead": {"agentDid", "capability", "price"}, "members": [{"agentDid", "capability", "price", "note"}]}
+- savedTeamId: a team saved at agrenting.com/dashboard/teams
+- teamListingId: a ready-made team from agrenting.com/agents?type=teams
+- Use exactly one of roster, savedTeamId or teamListingId.
+- maxTotalPrice (required): the adapter refuses a team whose total is higher
+- swarmCreateWakeReasons: comma-separated wake reasons that may create a team;
+  default issue_assigned,issue_commented; other wakes only resume a saved team
+- On timeout the adapter detaches without cancelling; the next run resumes the team.
+- Scopes: hire:create and hirings:read; teamListingId also needs agents:discover.
 `;
 
 const TERMINAL_STATUSES = new Set([
@@ -324,9 +336,13 @@ function requestFromRecovery(pending: Record<string, unknown>): HireAgentOptions
 }
 
 /** Canonical Paperclip ServerAdapterModule execution entry point. */
-export async function executePaperclip(
-  ctx: AdapterExecutionContext
-): Promise<AdapterExecutionResult> {
+export async function executePaperclip(ctx: AdapterExecutionContext, now: Date = new Date()): Promise<AdapterExecutionResult> {
+  if (ctx.config.mode === "swarm") return executePaperclipSwarm(ctx, now);
+  const savedSession = asRecord(ctx.runtime.sessionParams);
+  if (savedSession && swarmRecoveryPending(savedSession)) {
+    return swarmReconciliation(savedSession,
+      'A saved Agrenting team still needs recovery. Set mode back to "swarm" to finish it before this agent hires a single agent.');
+  }
   const config = configFrom(ctx.config);
   if (!config.apiKey || !config.agentDid) {
     return {
@@ -1396,8 +1412,7 @@ export function getPaperclipConfigSchema(): AdapterConfigSchema {
         key: "agentDid",
         label: "Agent DID",
         type: "text",
-        required: true,
-        hint: "Marketplace agent DID, for example did:agrenting:code-reviewer.",
+        hint: "Required in hiring mode. Marketplace agent DID, for example did:agrenting:code-reviewer.",
       },
       {
         key: "capabilityRequested",
@@ -1440,6 +1455,48 @@ export function getPaperclipConfigSchema(): AdapterConfigSchema {
         ],
         hint: "Use output unless the hiring also has repository credentials.",
       },
+      {
+        key: "mode",
+        label: "Mode",
+        type: "select",
+        default: "hiring",
+        options: [
+          { value: "hiring", label: "Hire one agent" },
+          { value: "swarm", label: "Hire a team" },
+        ],
+        hint: "Team mode hires a lead and 1-8 members for each allowed run.",
+      },
+      {
+        key: "roster",
+        label: "Team roster (JSON)",
+        type: "textarea",
+        hint: 'Team mode. {"lead": {"agentDid", "capability", "price"}, "members": [{"agentDid", "capability", "price", "note"}]}. Use exactly one of roster, savedTeamId or teamListingId.',
+      },
+      {
+        key: "savedTeamId",
+        label: "Saved team ID",
+        type: "text",
+        hint: "Team mode. A team saved at agrenting.com/dashboard/teams. Use exactly one of roster, savedTeamId or teamListingId.",
+      },
+      {
+        key: "teamListingId",
+        label: "Team listing ID",
+        type: "text",
+        hint: "Team mode. The id of a ready-made team from agrenting.com/agents?type=teams. Use exactly one of roster, savedTeamId or teamListingId.",
+      },
+      {
+        key: "maxTotalPrice",
+        label: "Maximum team total (USD)",
+        type: "text",
+        hint: "Required in team mode. The adapter refuses a team whose total is higher.",
+      },
+      {
+        key: "swarmCreateWakeReasons",
+        label: "Team create wake reasons",
+        type: "text",
+        default: "issue_assigned,issue_commented",
+        hint: "Team mode. Comma-separated Paperclip wake reasons that may create a paid team. Other wakes only resume a saved team.",
+      },
     ],
   };
 }
@@ -1464,7 +1521,7 @@ export const paperclipSessionCodec: CompatibilitySessionCodec = {
     return params;
   },
   getDisplayId(params: Record<string, unknown> | null): string | null {
-    return nonEmpty(params?.hiringId);
+    return nonEmpty(params?.hiringId) ?? nonEmpty(params?.swarmId);
   },
   encode(state: unknown): string {
     return JSON.stringify(state ?? null);
