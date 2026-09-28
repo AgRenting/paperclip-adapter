@@ -29,6 +29,18 @@ export interface AgrentingAdapterConfig {
   repoUrl?: string;
   /** How instructions are handled: "managed" (uploaded to Agrenting) or "inline" (passed in task context) */
   instructionsBundleMode?: "managed" | "inline";
+  /** "swarm" hires one Agrenting team per allowed run; any other value hires `agentDid`. */
+  mode?: "hiring" | "swarm";
+  /** Team mode roster, as an object or a JSON string. Use either roster or savedTeamId. */
+  roster?: SwarmRoster | string;
+  /** Team mode: id of a team saved at agrenting.com/dashboard/teams. */
+  savedTeamId?: string;
+  /** A listed team's id from GET /api/v1/team_listings. Use exactly one of roster, savedTeamId or teamListingId. */
+  teamListingId?: string;
+  /** Team mode: highest team total the adapter may create, e.g. "60.00". Required in team mode. */
+  maxTotalPrice?: string;
+  /** Team mode: wake reasons that may create a paid team (array or comma-separated). */
+  swarmCreateWakeReasons?: string[] | string;
 }
 
 /** Result of executing a task via the Agrenting adapter */
@@ -342,4 +354,168 @@ export interface AutoSelectOptions {
 /** Options for retrying a hiring */
 export interface RetryHiringOptions {
   reason?: string;
+}
+
+/** One roster slot in Paperclip team-mode config. */
+export interface SwarmRosterSlot {
+  agentDid: string;
+  capability: string;
+  price: string;
+  note?: string;
+}
+
+/** Team-mode roster: one lead and 1-8 members. */
+export interface SwarmRoster {
+  lead: SwarmRosterSlot;
+  members: SwarmRosterSlot[];
+}
+
+/** Parsed team-mode settings. Money is held in integer cents. */
+export interface SwarmModeConfig {
+  roster: SwarmRoster | null;
+  savedTeamId: string | null;
+  teamListingId: string | null;
+  maxTotalPriceCents: number;
+  swarmCreateWakeReasons: string[];
+}
+
+/** Lead slot sent to POST /api/v1/swarms. */
+export interface SwarmLeadBody {
+  agent_did: string;
+  capability_requested: string;
+  price: string;
+}
+
+/** Member slot sent to POST /api/v1/swarms. */
+export interface SwarmMemberBody extends SwarmLeadBody {
+  note?: string;
+}
+
+/** Body of POST /api/v1/swarms; the client sends it as {swarm: body}. */
+export interface SwarmCreateBody {
+  task_description: string;
+  task_input?: Record<string, unknown>;
+  delivery_mode: "output";
+  client_idempotency_key: string;
+  total_price: string;
+  lead?: SwarmLeadBody;
+  members?: SwarmMemberBody[];
+  saved_team_id?: string;
+  team_listing_id?: string;
+}
+
+export type SwarmStatusValue =
+  | "planning"
+  | "running"
+  | "merging"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | (string & {});
+
+/** Open question in the team status shape. */
+export interface SwarmQuestion {
+  question_id: string;
+  content: string;
+  asked_at?: string | null;
+  hiring_id?: string | null;
+  role?: string | null;
+  alias?: string | null;
+}
+
+export interface SwarmAgentRef {
+  did: string;
+  name: string;
+}
+
+export interface SwarmLeadStatus {
+  hiring_id?: string;
+  agent?: SwarmAgentRef | null;
+  status?: string;
+}
+
+export interface SwarmMemberStatus {
+  alias: string;
+  hiring_id?: string;
+  agent?: SwarmAgentRef | null;
+  capability?: string | null;
+  status: "reserved" | "starting" | "working" | "delivered" | "not_delivered" | (string & {});
+  title?: string | null;
+}
+
+export interface SwarmDeliverable {
+  task_output?: Record<string, unknown> | string | null;
+  artifact_ids?: string[];
+}
+
+/** Team status shape returned by POST /api/v1/swarms and GET /api/v1/swarms/:id. */
+export interface SwarmStatus {
+  swarm_id: string;
+  status: SwarmStatusValue;
+  final?: boolean;
+  phase?: "plan" | "members" | "merge" | "done" | (string & {});
+  phase_deadline_at?: string | null;
+  deadline_at?: string | null;
+  partial?: boolean;
+  failure_code?: string | null;
+  total_price?: string | null;
+  held?: string | null;
+  charged?: string | null;
+  refunded?: string | null;
+  plan?: { summary?: string; subtasks?: Array<{ alias: string; title: string }> } | null;
+  lead?: SwarmLeadStatus | null;
+  members?: SwarmMemberStatus[];
+  open_questions?: SwarmQuestion[];
+  deliverable?: SwarmDeliverable | null;
+}
+
+/** One agent of a saved team in GET /api/v1/saved_teams. */
+export interface SavedTeamSlot {
+  agent_did: string;
+  name?: string;
+  capability?: string | null;
+  price: string;
+  available?: boolean;
+  note?: string | null;
+}
+
+/** A saved team in GET /api/v1/saved_teams. */
+export interface SavedTeam {
+  id: string;
+  name: string;
+  lead: SavedTeamSlot;
+  members: SavedTeamSlot[];
+  total_price: string;
+}
+
+/** A listed team in GET /api/v1/team_listings and GET /api/v1/team_listings/:id. */
+export interface TeamListing {
+  id: string;
+  slug: string;
+  name: string;
+  total_price: string;
+  agent_count: number;
+  available: boolean;
+}
+
+/** Why a team create was refused; returned in resultJson. */
+export interface SwarmRejection {
+  httpStatus: number | null;
+  code: string | null;
+  message: string;
+  details: unknown[];
+}
+
+/** Classification of a failed POST /api/v1/swarms. */
+export type SwarmCreateFailure =
+  | { kind: "definitive"; httpStatus: number; code: string | null; message: string; details: unknown[] }
+  | { kind: "conflict"; message: string }
+  | { kind: "ambiguous"; message: string };
+
+/** Mutable recovery state of one team-mode run. */
+export interface SwarmRunState {
+  swarmId: string | null;
+  pendingCreate: Record<string, unknown> | null;
+  recoveryUrl: string;
+  recoveryFingerprint: string;
 }
