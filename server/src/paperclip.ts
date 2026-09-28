@@ -20,6 +20,9 @@ import type {
   SwarmModeConfig,
   SwarmRoster,
   SwarmRosterSlot,
+  SwarmCreateBody,
+  SwarmLeadBody,
+  SwarmMemberBody,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -275,6 +278,13 @@ function resultForFailure(
   };
 }
 
+/** True when a serialized request may contain credential material. */
+function containsCredential(serialized: string, apiKey: string): boolean {
+  return serialized.includes(apiKey) ||
+    /Bearer\s+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|ap_[A-Za-z0-9]{16,}|https?:\/\/[^/\s"]*@/i.test(serialized) ||
+    /"[^" ]*(?:token|secret|password|authorization|api[_-]?key)[^" ]*"\s*:/i.test(serialized);
+}
+
 function pendingCreation(
   agentDid: string,
   request: HireAgentOptions,
@@ -283,9 +293,7 @@ function pendingCreation(
   const serialized = JSON.stringify(request);
   // Auth config never enters a request snapshot. If task/repository context
   // contains credential material, retain only the key and require reconciliation.
-  const sensitive = serialized.includes(apiKey) ||
-    /Bearer\s+|ghp_[A-Za-z0-9]+|github_pat_[A-Za-z0-9_]+|ap_[A-Za-z0-9]{16,}|https?:\/\/[^/\s"]*@/i.test(serialized) ||
-    /"[^" ]*(?:token|secret|password|authorization|api[_-]?key)[^" ]*"\s*:/i.test(serialized);
+  const sensitive = containsCredential(serialized, apiKey);
   return {
     idempotencyKey: request.clientIdempotencyKey,
     agentDid,
@@ -673,6 +681,70 @@ export function swarmWakeReasonFrom(context: Record<string, unknown>): string | 
 /** True only when the wake reason is in the configured create list (15.5). */
 export function swarmCreateAllowed(reason: string | null, allowed: readonly string[]): boolean {
   return reason !== null && allowed.includes(reason);
+}
+
+
+/** Team task_input: the single-hire IDs without the raw wake payload. */
+export function swarmTaskInputFrom(ctx: AdapterExecutionContext): Record<string, unknown> {
+  const input = taskInputFrom(ctx);
+  delete input.paperclip_wake;
+  return input;
+}
+
+/** REST slots and the exact total, in cents, of a configured roster. */
+export function swarmRosterBody(
+  roster: SwarmRoster
+): { lead: SwarmLeadBody; members: SwarmMemberBody[]; totalCents: number } {
+  const slot = (entry: SwarmRosterSlot): SwarmLeadBody => ({
+    agent_did: entry.agentDid,
+    capability_requested: entry.capability,
+    price: entry.price,
+  });
+  const members = roster.members.map((member) => ({
+    ...slot(member),
+    ...(member.note ? { note: member.note } : {}),
+  }));
+  const totalCents = [roster.lead, ...roster.members]
+    .reduce((sum, entry) => sum + (priceToCents(entry.price) ?? 0), 0);
+  return { lead: slot(roster.lead), members, totalCents };
+}
+
+/** Recovery snapshot of a team create; createdAt is the first attempt's time. */
+export function pendingSwarmCreation(
+  body: SwarmCreateBody,
+  apiKey: string,
+  now: Date
+): Record<string, unknown> {
+  const serialized = JSON.stringify(body);
+  return {
+    kind: "swarm",
+    idempotencyKey: body.client_idempotency_key,
+    createdAt: now.toISOString(),
+    ...(containsCredential(serialized, apiKey) ? { manualOnly: true } : { request: JSON.parse(serialized) }),
+  };
+}
+
+/** The exact saved team request, or null when it may not be replayed. */
+export function swarmRequestFromRecovery(pending: Record<string, unknown>): SwarmCreateBody | null {
+  const request = asRecord(pending.request);
+  const key = nonEmpty(pending.idempotencyKey);
+  if (pending.kind !== "swarm" || pending.manualOnly || !request || !key ||
+      request.client_idempotency_key !== key ||
+      !nonEmpty(request.task_description) ||
+      request.delivery_mode !== "output" ||
+      priceToCents(request.total_price) === null ||
+      (request.task_input !== undefined && !asRecord(request.task_input))) return null;
+  const hasRoster = asRecord(request.lead) !== null && Array.isArray(request.members);
+  const hasSavedTeam = nonEmpty(request.saved_team_id) !== null;
+  const hasTeamListing = nonEmpty(request.team_listing_id) !== null;
+  if ([hasRoster, hasSavedTeam, hasTeamListing].filter(Boolean).length !== 1) return null;
+  if (hasTeamListing && ["lead", "members", "saved_team_id"].some((field) => field in request)) return null;
+  const allowed = new Set([
+    "task_description", "task_input", "delivery_mode", "client_idempotency_key",
+    "total_price", "lead", "members", "saved_team_id", "team_listing_id",
+  ]);
+  if (Object.keys(request).some((field) => !allowed.has(field))) return null;
+  return request as unknown as SwarmCreateBody;
 }
 
 function summarizeChecks(
