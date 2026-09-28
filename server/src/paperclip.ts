@@ -1172,6 +1172,113 @@ export async function startSwarm(run: SwarmRun): Promise<SwarmStatus | AdapterEx
   return created;
 }
 
+
+/** One team-mode run: validate, guard, bind recovery, start, poll, then detach or report once. */
+export async function executePaperclipSwarm(
+  ctx: AdapterExecutionContext,
+  now: Date
+): Promise<AdapterExecutionResult> {
+  const config = configFrom(ctx.config);
+  const parsed = swarmConfigFrom(ctx.config);
+  if (!config.apiKey) {
+    return { exitCode: 1, signal: null, timedOut: false, errorCode: "agrenting_config_invalid",
+      errorMessage: "Agrenting requires apiKey." };
+  }
+  if (!parsed.ok) {
+    return { exitCode: 1, signal: null, timedOut: false, errorCode: "agrenting_config_invalid",
+      errorMessage: parsed.error };
+  }
+  const prior = asRecord(ctx.runtime.sessionParams);
+  if (prior && hiringRecoveryPending(prior)) {
+    return swarmReconciliation(prior,
+      'A saved single-agent hiring still needs recovery. Set mode back to "hiring" to finish it before this agent hires a team.');
+  }
+
+  const credentialFingerprint = createHash("sha256").update(config.apiKey).digest("hex");
+  const savedSwarmId = prior?.recoveryRequired === true ? nonEmpty(prior.swarmId) : null;
+  const pendingCreate = prior?.recoveryRequired === true && !savedSwarmId
+    ? asRecord(prior.pendingCreate) ?? { kind: "swarm", manualOnly: true } : null;
+  const recovering = Boolean(savedSwarmId || pendingCreate);
+  const state: SwarmRunState = {
+    swarmId: savedSwarmId,
+    pendingCreate,
+    recoveryUrl: recovering ? nonEmpty(prior?.agrentingUrl) ?? config.agrentingUrl : config.agrentingUrl,
+    recoveryFingerprint: recovering
+      ? nonEmpty(prior?.credentialFingerprint) ?? credentialFingerprint : credentialFingerprint,
+  };
+  const openQuestions = new Map<string, SwarmQuestion>();
+  const client = new AgrentingClient(config);
+  let status: SwarmStatus | undefined;
+
+  try {
+    if (recovering && (
+      new URL(state.recoveryUrl).href.replace(/\/+$/, "") !== new URL(config.agrentingUrl).href.replace(/\/+$/, "") ||
+      state.recoveryFingerprint !== credentialFingerprint)) {
+      return swarmReconciliation(swarmSession(state),
+        "Restore the original Agrenting URL and credential to reconcile the saved team before creating another.");
+    }
+    const started = await startSwarm({ ctx, client, config, swarm: parsed.value, state, prior, now });
+    if (isAdapterResult(started)) return started;
+    status = started;
+
+    const recordQuestions = async (snapshot: SwarmStatus): Promise<void> => {
+      for (const question of swarmOpenQuestions(snapshot)) {
+        if (openQuestions.has(question.question_id)) continue;
+        openQuestions.set(question.question_id, question);
+        await ctx.onLog("stderr",
+          `[agrenting] Open question ${question.question_id} (${question.alias ?? question.role ?? "team"}): ${question.content}\n`);
+      }
+    };
+    const activeSwarmId = state.swarmId ?? status.swarm_id;
+    const timeoutSec = config.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
+    const pollIntervalMs = config.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const deadline = Date.now() + timeoutSec * 1_000;
+    let lastStatus = status.status;
+    await recordQuestions(status);
+    while (!swarmFinal(status) && Date.now() < deadline) {
+      await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())));
+      status = await client.getSwarm(activeSwarmId);
+      await recordQuestions(status);
+      if (status.status !== lastStatus) {
+        lastStatus = status.status;
+        await ctx.onLog("stdout", `[agrenting] Team ${activeSwarmId} is ${status.status}\n`);
+      }
+    }
+
+    const questions = Array.from(openQuestions.values());
+    if (!swarmFinal(status)) {
+      await safeLog(ctx, "stderr",
+        `[agrenting] Team ${activeSwarmId} is still ${status.status} after ${timeoutSec}s; detached without cancelling\n`);
+      return swarmDetachResult(status, state, timeoutSec, config.agrentingUrl, questions);
+    }
+    if (status.status === "completed") await ctx.onLog("stdout", `${swarmDeliverableText(status)}\n`);
+    return swarmFinalResult(status, config.agrentingUrl, questions);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await safeLog(ctx, "stderr", `[agrenting] ${message}\n`);
+    const replayable = state.pendingCreate === null || swarmRequestFromRecovery(state.pendingCreate) !== null;
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: replayable ? "agrenting_swarm_request_failed" : "agrenting_hiring_reconciliation_required",
+      errorFamily: replayable && classifySwarmCreateError(error).kind === "ambiguous" ? "transient_upstream" : null,
+      errorMessage: message,
+      provider: "agrenting",
+      biller: "agrenting",
+      ...(state.swarmId || state.pendingCreate ? {
+        sessionParams: swarmSession(state),
+        sessionDisplayId: state.swarmId,
+        resultJson: {
+          swarmId: state.swarmId,
+          status: status?.status ?? "unknown",
+          openQuestions: Array.from(openQuestions.values()),
+        },
+      } : {}),
+    };
+  }
+}
+
 function summarizeChecks(
   checks: AdapterEnvironmentCheck[]
 ): AdapterEnvironmentTestResult["status"] {
