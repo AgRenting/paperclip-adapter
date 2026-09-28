@@ -28,6 +28,8 @@ import type {
   SwarmStatus,
   SwarmRejection,
   SwarmRunState,
+  SavedTeam,
+  TeamListing,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -1023,6 +1025,151 @@ export function swarmDetachResult(
     sessionDisplayId: state.swarmId,
     resultJson: swarmResultJson(status, baseUrl, openQuestions),
   };
+}
+
+
+export interface SwarmRun {
+  ctx: AdapterExecutionContext;
+  client: AgrentingClient;
+  config: AgrentingAdapterConfig;
+  swarm: SwarmModeConfig;
+  state: SwarmRunState;
+  prior: Record<string, unknown> | null;
+  now: Date;
+}
+
+async function safeLog(
+  ctx: AdapterExecutionContext,
+  stream: "stdout" | "stderr",
+  chunk: string
+): Promise<void> {
+  try {
+    await ctx.onLog(stream, chunk);
+  } catch {
+    // A host logging outage must not discard team recovery state.
+  }
+}
+
+/** Replay, resume, wake gate, budget and create, in that order (15.2, 15.4, 15.5). */
+export async function startSwarm(run: SwarmRun): Promise<SwarmStatus | AdapterExecutionResult> {
+  const { ctx, client, config, swarm, state, prior, now } = run;
+  if (state.pendingCreate) {
+    const key = nonEmpty(state.pendingCreate.idempotencyKey) ?? "unknown";
+    const request = swarmRequestFromRecovery(state.pendingCreate);
+    if (!request) {
+      return swarmReconciliation(swarmSession(state),
+        `Manual reconciliation required for team idempotency key ${key}; no replacement was created.`);
+    }
+    if (!swarmReplayAllowed(state.pendingCreate.createdAt, now)) {
+      return swarmReconciliation(swarmSession(state),
+        `The team request with idempotency key ${key} was first sent more than 30 minutes ago and will not be replayed. Check your teams on Agrenting, then clear this agent's session.`);
+    }
+    await ctx.onLog("stdout", `[agrenting] Replaying team request ${key} first sent at ${String(state.pendingCreate.createdAt)}\n`);
+    return createSwarmOrFail(client, state, request);
+  }
+
+  if (state.swarmId) {
+    const status = await client.getSwarm(state.swarmId);
+    await ctx.onLog("stdout", `[agrenting] Resuming team ${state.swarmId} with status ${status.status}\n`);
+    return status;
+  }
+
+  const reason = swarmWakeReasonFrom(ctx.context);
+  if (!swarmCreateAllowed(reason, swarm.swarmCreateWakeReasons)) {
+    const summary = `No Agrenting team was created: wake reason ${reason ?? "(none)"} is not in swarmCreateWakeReasons.`;
+    await safeLog(ctx, "stdout", `[agrenting] ${summary}\n`);
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "agrenting",
+      biller: "agrenting",
+      summary,
+      resultJson: { swarmCreated: false, wakeReason: reason },
+      ...(prior ? { sessionParams: prior, sessionDisplayId: nonEmpty(prior.swarmId) ?? nonEmpty(prior.hiringId) } : {}),
+    };
+  }
+
+  const base = {
+    task_description: taskDescriptionFrom(ctx),
+    task_input: swarmTaskInputFrom(ctx),
+    delivery_mode: "output" as const,
+    client_idempotency_key: ctx.runId,
+  };
+  let body: SwarmCreateBody;
+  let totalCents: number;
+  let description: string;
+  if (swarm.roster) {
+    const built = swarmRosterBody(swarm.roster);
+    totalCents = built.totalCents;
+    body = { ...base, total_price: centsToPrice(totalCents), lead: built.lead, members: built.members };
+    description = `a team of 1 lead and ${built.members.length} members`;
+  } else if (swarm.teamListingId) {
+    const listingId = swarm.teamListingId;
+    let listing: TeamListing;
+    try {
+      listing = await client.getTeamListing(listingId);
+    } catch (error) {
+      const facts = asRecord(error);
+      if (facts?.status !== 404) throw error;
+      const message = `Team listing ${listingId} was not found for this API key.`;
+      return swarmRejected(message, {
+        httpStatus: 404, code: typeof facts.code === "string" ? facts.code : null, message,
+        details: [{ slot: "team_listing_id", code: "not_found" }],
+      });
+    }
+    const cents = priceToCents(listing.total_price);
+    if (cents === null) throw new Error(`Agrenting returned team listing ${listing.id} without a readable total_price.`);
+    totalCents = cents;
+    body = { ...base, total_price: centsToPrice(cents), team_listing_id: listing.id };
+    description = `listed team ${listing.name} (${listing.id})`;
+  } else {
+    const teamId = swarm.savedTeamId ?? "";
+    const team = (await client.listSavedTeams()).find((entry: SavedTeam) => entry.id === teamId);
+    if (!team) {
+      const message = `Saved team ${teamId} was not found for this API key; no team was created.`;
+      return swarmRejected(message, {
+        httpStatus: null, code: null, message,
+        details: [{ slot: "saved_team_id", code: "not_found" }],
+      });
+    }
+    const cents = priceToCents(team.total_price);
+    if (cents === null) throw new Error(`Agrenting returned saved team ${team.id} without a readable total_price.`);
+    totalCents = cents;
+    body = { ...base, total_price: centsToPrice(cents), saved_team_id: team.id };
+    description = `saved team ${team.name} (${team.id})`;
+  }
+
+  const total = centsToPrice(totalCents);
+  const max = centsToPrice(swarm.maxTotalPriceCents);
+  if (totalCents > swarm.maxTotalPriceCents) {
+    const message = `Team total ${total} exceeds maxTotalPrice ${max}; no team was created.`;
+    return swarmRejected(message, {
+      httpStatus: null, code: null, message,
+      details: [{ slot: "total_price", code: "max_total_price_exceeded", total_price: total, max_total_price: max }],
+    });
+  }
+
+  await ctx.onLog("stdout", `[agrenting] Hiring ${description} for ${total} (maxTotalPrice ${max})\n`);
+  state.pendingCreate = pendingSwarmCreation(body, config.apiKey, now);
+  const created = await createSwarmOrFail(client, state, body);
+  if (!isAdapterResult(created)) {
+    await ctx.onMeta?.({
+      adapterType: type,
+      command: "POST /api/v1/swarms",
+      context: {
+        swarmId: state.swarmId,
+        totalPrice: total,
+        ...(body.saved_team_id
+          ? { savedTeamId: body.saved_team_id }
+          : body.team_listing_id
+            ? { teamListingId: body.team_listing_id }
+            : { memberCount: body.members?.length ?? 0 }),
+      },
+    });
+    await ctx.onLog("stdout", `[agrenting] Team ${state.swarmId} created with status ${created.status}\n`);
+  }
+  return created;
 }
 
 function summarizeChecks(
