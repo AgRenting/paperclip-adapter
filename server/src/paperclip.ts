@@ -121,7 +121,7 @@ function taskDescriptionFrom(ctx: AdapterExecutionContext): string {
     description = `Continue the assigned Paperclip work for ${ctx.agent.name}.`;
   }
   if (description.length <= MAX_TASK_DESCRIPTION_LENGTH) return description;
-  return `${description.slice(0, MAX_TASK_DESCRIPTION_LENGTH - 32)}\n\n[truncated by Paperclip adapter]`;
+  return `${description.slice(0, MAX_TASK_DESCRIPTION_LENGTH - 34)}\n\n[truncated by Paperclip adapter]`;
 }
 
 function capabilityFrom(
