@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0 (unreleased)
+
+- Add team mode (`mode: "swarm"`): each allowed run hires one Agrenting team
+  (a lead and 1-8 members) from a configured `roster`, a saved team
+  (`savedTeamId`) or a provider's ready-made team (`teamListingId`) through
+  `POST /api/v1/swarms`, capped by the required `maxTotalPrice`.
+- Create teams only on wake reasons in `swarmCreateWakeReasons` (default
+  `issue_assigned,issue_commented`); other wakes resume a saved team or do
+  nothing.
+- Detach on timeout without cancelling; the next run resumes the saved
+  `swarmId`. Report `costUsd` as the team's charged amount and return the
+  lead's deliverable, member summaries and open questions.
+- Treat 4xx team refusals as final (`agrenting_swarm_rejected` with per-slot
+  details) and replay uncertain failures with the same key only within 30
+  minutes of the first attempt.
+- Keep truncated task descriptions within Agrenting's 5,000-character limit.
+
 ## 0.4.1 (unreleased)
 
 - Recover accepted hirings and ambiguous creation responses across Paperclip runs
