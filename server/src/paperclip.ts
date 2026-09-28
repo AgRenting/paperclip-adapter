@@ -24,6 +24,8 @@ import type {
   SwarmLeadBody,
   SwarmMemberBody,
   SwarmCreateFailure,
+  SwarmQuestion,
+  SwarmStatus,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -788,6 +790,113 @@ export function hiringRecoveryPending(prior: Record<string, unknown>): boolean {
 /** A team session that must be finished before hiring mode may spend. */
 export function swarmRecoveryPending(prior: Record<string, unknown>): boolean {
   return prior.mode === "swarm" && prior.recoveryRequired === true;
+}
+
+
+const SWARM_TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+export function swarmFinal(status: SwarmStatus): boolean {
+  return status.final === true || SWARM_TERMINAL_STATUSES.has(status.status);
+}
+
+/** Allowlisted open questions of the lead and every member (15.6). */
+export function swarmOpenQuestions(status: SwarmStatus): SwarmQuestion[] {
+  return (status.open_questions ?? [])
+    .filter((question) => nonEmpty(question?.question_id) !== null && typeof question.content === "string")
+    .map((question) => ({
+      question_id: question.question_id,
+      content: question.content,
+      asked_at: question.asked_at ?? null,
+      hiring_id: question.hiring_id ?? null,
+      role: question.role ?? null,
+      alias: question.alias ?? null,
+    }));
+}
+
+/** costUsd = the team's charged amount (15.2). */
+export function swarmCostUsd(status: SwarmStatus): number | null {
+  const cents = priceToCents(status.charged);
+  return cents === null ? null : cents / 100;
+}
+
+export function swarmDeliverableText(status: SwarmStatus): string {
+  const output = status.deliverable?.task_output;
+  if (typeof output === "string" && output.trim()) return output;
+  const record = asRecord(output);
+  if (record) {
+    for (const key of ["result", "output", "text", "summary"]) {
+      const direct = nonEmpty(record[key]);
+      if (direct) return direct;
+    }
+    if (Object.keys(record).length > 0) return JSON.stringify(record, null, 2);
+  }
+  const count = status.deliverable?.artifact_ids?.length ?? 0;
+  const noun = count === 1 ? "artifact" : "artifacts";
+  return count > 0
+    ? `Agrenting team ${status.swarm_id} completed with ${count} ${noun}.`
+    : `Agrenting team ${status.swarm_id} completed.`;
+}
+
+export function swarmResultJson(
+  status: SwarmStatus,
+  baseUrl: string,
+  openQuestions: SwarmQuestion[]
+): Record<string, unknown> {
+  const origin = new URL(`${baseUrl.replace(/\/+$/, "")}/`);
+  const deliverable = status.deliverable ?? null;
+  return {
+    swarmId: status.swarm_id,
+    status: status.status,
+    phase: status.phase ?? null,
+    final: swarmFinal(status),
+    partial: status.partial === true,
+    failureCode: status.failure_code ?? null,
+    totalPrice: status.total_price ?? null,
+    charged: status.charged ?? null,
+    refunded: status.refunded ?? null,
+    deliverable: deliverable
+      ? {
+          taskOutput: deliverable.task_output ?? null,
+          artifacts: (deliverable.artifact_ids ?? []).map((id) => ({
+            id,
+            download_url: authenticatedArtifactUrl({ id }, origin),
+          })),
+        }
+      : null,
+    members: (status.members ?? []).map((member) => ({
+      alias: member.alias,
+      title: member.title ?? null,
+      status: member.status,
+    })),
+    openQuestions,
+  };
+}
+
+export function swarmFinalResult(
+  status: SwarmStatus,
+  baseUrl: string,
+  openQuestions: SwarmQuestion[]
+): AdapterExecutionResult {
+  const base = {
+    signal: null,
+    timedOut: false,
+    provider: "agrenting",
+    biller: "agrenting",
+    billingType: "fixed" as const,
+    costUsd: swarmCostUsd(status),
+    sessionParams: { mode: "swarm", swarmId: status.swarm_id, recoveryRequired: false },
+    sessionDisplayId: status.swarm_id,
+    resultJson: swarmResultJson(status, baseUrl, openQuestions),
+  };
+  if (status.status === "completed") {
+    return { ...base, exitCode: 0, summary: firstLine(swarmDeliverableText(status)) };
+  }
+  return {
+    ...base,
+    exitCode: 1,
+    errorCode: `agrenting_swarm_${status.status}`,
+    errorMessage: `Agrenting team ${status.swarm_id} ended with status ${status.status}${status.failure_code ? ` (${status.failure_code})` : ""}.`,
+  };
 }
 
 function summarizeChecks(
