@@ -26,6 +26,8 @@ import type {
   SwarmCreateFailure,
   SwarmQuestion,
   SwarmStatus,
+  SwarmRejection,
+  SwarmRunState,
 } from "./types.js";
 
 export const type = "agrenting";
@@ -896,6 +898,130 @@ export function swarmFinalResult(
     exitCode: 1,
     errorCode: `agrenting_swarm_${status.status}`,
     errorMessage: `Agrenting team ${status.swarm_id} ended with status ${status.status}${status.failure_code ? ` (${status.failure_code})` : ""}.`,
+  };
+}
+
+
+export function swarmSession(state: SwarmRunState): Record<string, unknown> {
+  return {
+    mode: "swarm",
+    ...(state.swarmId ? { swarmId: state.swarmId } : {}),
+    ...(state.pendingCreate ? { pendingCreate: state.pendingCreate } : {}),
+    recoveryRequired: true,
+    agrentingUrl: state.recoveryUrl,
+    credentialFingerprint: state.recoveryFingerprint,
+  };
+}
+
+export function swarmReconciliation(
+  sessionParams: Record<string, unknown>,
+  message: string
+): AdapterExecutionResult {
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorCode: "agrenting_hiring_reconciliation_required",
+    errorMessage: message,
+    provider: "agrenting",
+    biller: "agrenting",
+    sessionParams,
+    sessionDisplayId: nonEmpty(sessionParams.swarmId) ?? nonEmpty(sessionParams.hiringId),
+  };
+}
+
+export function swarmRejected(errorMessage: string, rejection: SwarmRejection): AdapterExecutionResult {
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: false,
+    errorCode: "agrenting_swarm_rejected",
+    errorMessage,
+    provider: "agrenting",
+    biller: "agrenting",
+    sessionParams: { mode: "swarm", recoveryRequired: false },
+    resultJson: { rejected: true, ...rejection },
+  };
+}
+
+export function isAdapterResult(
+  value: SwarmStatus | AdapterExecutionResult
+): value is AdapterExecutionResult {
+  return "exitCode" in value;
+}
+
+/** POST /api/v1/swarms and apply the definitive / conflict / ambiguous rules to state.pendingCreate. */
+export async function createSwarmOrFail(
+  client: AgrentingClient,
+  state: SwarmRunState,
+  body: SwarmCreateBody
+): Promise<SwarmStatus | AdapterExecutionResult> {
+  try {
+    const created = await client.createSwarm(body);
+    const swarmId = nonEmpty(created?.swarm_id);
+    if (!swarmId) throw new Error("Agrenting accepted the team request but returned no swarm_id.");
+    state.swarmId = swarmId;
+    state.pendingCreate = null;
+    return created;
+  } catch (error) {
+    const failure = classifySwarmCreateError(error);
+    if (failure.kind === "definitive") {
+      state.pendingCreate = null;
+      const label = failure.code ? `HTTP ${failure.httpStatus} ${failure.code}` : `HTTP ${failure.httpStatus}`;
+      return swarmRejected(`Agrenting refused the team (${label}): ${failure.message}`, {
+        httpStatus: failure.httpStatus,
+        code: failure.code,
+        message: failure.message,
+        details: failure.details,
+      });
+    }
+    if (failure.kind === "conflict") {
+      state.pendingCreate = {
+        kind: "swarm",
+        idempotencyKey: body.client_idempotency_key,
+        createdAt: state.pendingCreate?.createdAt ?? null,
+        manualOnly: true,
+      };
+      return swarmReconciliation(
+        swarmSession(state),
+        `Agrenting already holds a different team request under idempotency key ${body.client_idempotency_key}; no team was created. Check your teams on Agrenting, then clear this agent's session.`
+      );
+    }
+    const replayable = state.pendingCreate !== null && swarmRequestFromRecovery(state.pendingCreate) !== null;
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: replayable ? "agrenting_swarm_request_failed" : "agrenting_hiring_reconciliation_required",
+      errorFamily: replayable ? "transient_upstream" : null,
+      errorMessage: failure.message,
+      provider: "agrenting",
+      biller: "agrenting",
+      sessionParams: swarmSession(state),
+      resultJson: { swarmId: null, status: "unknown", openQuestions: [] },
+    };
+  }
+}
+
+/** Timeout: keep the swarmId for the next run; never cancel (15.3). */
+export function swarmDetachResult(
+  status: SwarmStatus,
+  state: SwarmRunState,
+  timeoutSec: number,
+  baseUrl: string,
+  openQuestions: SwarmQuestion[]
+): AdapterExecutionResult {
+  return {
+    exitCode: null,
+    signal: null,
+    timedOut: true,
+    errorCode: "agrenting_swarm_timeout",
+    errorMessage: `Agrenting team ${state.swarmId} is still ${status.status} after ${timeoutSec}s. The adapter detached without cancelling; the next run resumes it.`,
+    provider: "agrenting",
+    biller: "agrenting",
+    sessionParams: swarmSession(state),
+    sessionDisplayId: state.swarmId,
+    resultJson: swarmResultJson(status, baseUrl, openQuestions),
   };
 }
 
