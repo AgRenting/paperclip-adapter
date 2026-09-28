@@ -1,14 +1,16 @@
-import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { AdapterEnvironmentTestContext, AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   centsToPrice,
   classifySwarmCreateError,
   executePaperclip,
+  paperclipSessionCodec,
   priceToCents,
   swarmConfigFrom,
   swarmReplayAllowed,
   swarmRequestFromRecovery,
   swarmWakeReasonFrom,
+  testPaperclipEnvironment,
 } from "./paperclip.js";
 
 const clientMocks = vi.hoisted(() => ({
@@ -635,5 +637,200 @@ describe("team create failures", () => {
       sessionParams: { pendingCreate: { manualOnly: true } },
     });
     expect(JSON.stringify(result.sessionParams)).not.toContain("ap_test");
+  });
+});
+
+describe("team resume, detach and results", () => {
+  const running = { ...planning, status: "running", phase: "members" };
+
+  it("resumes the saved swarmId on any wake", async () => {
+    clientMocks.getSwarm.mockResolvedValueOnce(running).mockResolvedValue(completed);
+    const ctx = nextRun({ mode: "swarm", swarmId: "swarm-1", recoveryRequired: true });
+
+    const result = await executePaperclip(ctx, NOW);
+
+    expect(result.exitCode).toBe(0);
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
+    expect(ctx.onLog).toHaveBeenCalledWith("stdout", "[agrenting] Resuming team swarm-1 with status running\n");
+  });
+
+  it("detaches on timeout without cancelling and resumes next run", async () => {
+    clientMocks.createSwarm.mockResolvedValue(running);
+    clientMocks.getSwarm.mockResolvedValue(running);
+    let clock = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      clock += 1_000;
+      return clock;
+    });
+    let first;
+    try {
+      first = await executePaperclip(swarmContext({ timeoutSec: 1 }), NOW);
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(first).toMatchObject({
+      exitCode: null,
+      timedOut: true,
+      errorCode: "agrenting_swarm_timeout",
+      errorMessage: "Agrenting team swarm-1 is still running after 1s. The adapter detached without cancelling; the next run resumes it.",
+      sessionParams: { mode: "swarm", swarmId: "swarm-1", recoveryRequired: true },
+      sessionDisplayId: "swarm-1",
+    });
+    expect(clientMocks.cancelHiring).not.toHaveBeenCalled();
+
+    clientMocks.getSwarm.mockResolvedValue(completed);
+    const second = await executePaperclip(nextRun(first.sessionParams), NOW);
+
+    expect(second).toMatchObject({ exitCode: 0, costUsd: 45 });
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports charged as cost for a failed team", async () => {
+    clientMocks.createSwarm.mockResolvedValue({
+      ...completed, status: "failed", failure_code: "merge_failed", partial: true, charged: "35.00", deliverable: null,
+    });
+
+    const result = await executePaperclip(swarmContext(), NOW);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_swarm_failed",
+      errorMessage: "Agrenting team swarm-1 ended with status failed (merge_failed).",
+      costUsd: 35,
+      resultJson: { failureCode: "merge_failed", partial: true, deliverable: null },
+    });
+  });
+
+  it("returns an allowlisted result", async () => {
+    clientMocks.createSwarm.mockResolvedValue(completed);
+
+    const result = await executePaperclip(swarmContext(), NOW);
+
+    expect(result.resultJson).toEqual({
+      swarmId: "swarm-1",
+      status: "completed",
+      phase: "done",
+      final: true,
+      partial: false,
+      failureCode: null,
+      totalPrice: "45.00",
+      charged: "45.00",
+      refunded: "0.00",
+      deliverable: {
+        taskOutput: { result: "Auth hardened\nDetails follow." },
+        artifacts: [{ id: "artifact-1", download_url: "https://agrenting.com/api/v1/artifacts/artifact-1/download" }],
+      },
+      members: [
+        { alias: "m1", title: "Review auth", status: "delivered" },
+        { alias: "m2", title: "Test auth", status: "delivered" },
+      ],
+      openQuestions: [],
+    });
+    const serialized = JSON.stringify(result.resultJson);
+    expect(serialized).not.toContain("did:agrenting");
+    expect(serialized).not.toContain("h-m1");
+  });
+
+  it("returns open questions once", async () => {
+    const q = {
+      question_id: "q-1", content: "Which auth provider?", asked_at: "2026-09-26T10:03:00Z",
+      hiring_id: "h-m1", role: "member", alias: "m1", extra: "drop me",
+    };
+    clientMocks.createSwarm.mockResolvedValue({ ...running, open_questions: [q] });
+    clientMocks.getSwarm.mockResolvedValue({ ...completed, open_questions: [q] });
+    const ctx = swarmContext();
+
+    const result = await executePaperclip(ctx, NOW);
+
+    const line = "[agrenting] Open question q-1 (m1): Which auth provider?\n";
+    const logged = vi.mocked(ctx.onLog).mock.calls.filter(([stream, chunk]) => stream === "stderr" && chunk === line);
+    expect(logged).toHaveLength(1);
+    expect(result.resultJson?.openQuestions).toEqual([
+      { question_id: "q-1", content: "Which auth provider?", asked_at: "2026-09-26T10:03:00Z", hiring_id: "h-m1", role: "member", alias: "m1" },
+    ]);
+  });
+});
+
+describe("team guards and session codec", () => {
+  it("refuses a team while a single-agent hiring needs recovery", async () => {
+    const session = { hiringId: "hiring-1", recoveryRequired: true };
+
+    const result = await executePaperclip(nextRun(session, { wakeReason: "issue_assigned" }), NOW);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_hiring_reconciliation_required",
+      errorMessage: 'A saved single-agent hiring still needs recovery. Set mode back to "hiring" to finish it before this agent hires a team.',
+      sessionParams: session,
+    });
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
+    expect(clientMocks.getSwarm).not.toHaveBeenCalled();
+  });
+
+  it("refuses a single hiring while a team needs recovery", async () => {
+    const ctx = {
+      ...swarmContext({ mode: "hiring", agentDid: "did:agrenting:reviewer" }),
+      runtime: { sessionId: null, sessionParams: { mode: "swarm", swarmId: "swarm-1", recoveryRequired: true }, sessionDisplayId: null, taskKey: null },
+    };
+
+    const result = await executePaperclip(ctx, NOW);
+
+    expect(result.errorMessage).toBe(
+      'A saved Agrenting team still needs recovery. Set mode back to "swarm" to finish it before this agent hires a single agent.'
+    );
+    expect(clientMocks.hireAgent).not.toHaveBeenCalled();
+    expect(clientMocks.getHiring).not.toHaveBeenCalled();
+  });
+
+  it("shows the swarmId as the session display id", () => {
+    expect(paperclipSessionCodec.getDisplayId?.({ mode: "swarm", swarmId: "swarm-1", recoveryRequired: false })).toBe("swarm-1");
+  });
+
+  it("reports an invalid roster as a config error", async () => {
+    const result = await executePaperclip(swarmContext({ roster: "{" }), NOW);
+
+    expect(result).toMatchObject({ exitCode: 1, errorCode: "agrenting_config_invalid", errorMessage: "roster must be valid JSON." });
+  });
+});
+
+describe("team environment test", () => {
+  const env = (config: Record<string, unknown>): AdapterEnvironmentTestContext => ({
+    companyId: "company-1",
+    adapterType: "agrenting",
+    config,
+  });
+  const base = { agrentingUrl: "https://agrenting.com", apiKey: "ap_test", mode: "swarm", roster, maxTotalPrice: "50.00" };
+
+  it("checks a roster against the budget without an agent profile", async () => {
+    const result = await testPaperclipEnvironment(env(base));
+
+    expect(result.status).toBe("pass");
+    expect(result.checks.map((check) => check.code)).toEqual(["agrenting_connection_ok", "agrenting_swarm_roster_ok"]);
+    expect(clientMocks.getAgentProfile).not.toHaveBeenCalled();
+  });
+
+  it("fails a saved team that is not found", async () => {
+    clientMocks.listSavedTeams.mockResolvedValue([savedTeam]);
+
+    const result = await testPaperclipEnvironment(env({ ...base, roster: undefined, savedTeamId: "team-9" }));
+
+    expect(result.status).toBe("fail");
+    expect(result.checks.map((check) => check.code)).toContain("agrenting_saved_team_missing");
+  });
+
+  it("checks a listed team and fails one that is not found", async () => {
+    const config = { ...base, roster: undefined, teamListingId: "listing-1" };
+    clientMocks.getTeamListing.mockResolvedValueOnce(teamListing);
+
+    const found = await testPaperclipEnvironment(env(config));
+    expect(found.status).toBe("pass");
+    expect(found.checks.map((check) => check.code)).toEqual(["agrenting_connection_ok", "agrenting_team_listing_ok"]);
+
+    clientMocks.getTeamListing.mockRejectedValueOnce(apiError(404, "NOT_FOUND"));
+    const missing = await testPaperclipEnvironment(env(config));
+    expect(missing.status).toBe("fail");
+    expect(missing.checks.map((check) => check.code)).toContain("agrenting_team_listing_missing");
+    expect(clientMocks.listSavedTeams).not.toHaveBeenCalled();
   });
 });
