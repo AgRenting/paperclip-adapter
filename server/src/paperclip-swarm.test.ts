@@ -507,3 +507,133 @@ describe("task description truncation", () => {
     expect((clientMocks.hireAgent.mock.calls[0][1].taskDescription as string)).toHaveLength(5000);
   });
 });
+
+function nextRun(
+  sessionParams: Record<string, unknown> | null | undefined,
+  context: Record<string, unknown> = { wakeReason: "heartbeat_timer" },
+  config: Record<string, unknown> = {}
+): AdapterExecutionContext {
+  const ctx = swarmContext(config, context);
+  return {
+    ...ctx,
+    runId: "run-456",
+    runtime: { ...ctx.runtime, sessionParams: sessionParams ?? null },
+  };
+}
+
+describe("team create failures", () => {
+  it.each<[number, string]>([
+    [402, "INSUFFICIENT_BALANCE"],
+    [403, "FORBIDDEN"],
+    [403, "SWARMS_DISABLED"],
+    [404, "NOT_FOUND"],
+    [409, "AGENT_BUSY"],
+    [409, "LEAD_DECLINED"],
+    [409, "SWARM_LIMIT_REACHED"],
+    [422, "VALIDATION_ERROR"],
+  ])("treats HTTP %i %s as a final rejection that is never replayed", async (status, code) => {
+    const details = [{ slot: "members[0]", agent_did: "did:agrenting:reviewer", code: "agent_busy" }];
+    clientMocks.createSwarm.mockRejectedValue(apiError(status, code, details));
+
+    const result = await executePaperclip(swarmContext(), NOW);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_swarm_rejected",
+      errorMessage: `Agrenting refused the team (HTTP ${status} ${code}): ${code} message`,
+      sessionParams: { mode: "swarm", recoveryRequired: false },
+      resultJson: { rejected: true, httpStatus: status, code, details },
+    });
+    expect(result.sessionParams).not.toHaveProperty("pendingCreate");
+
+    await executePaperclip(nextRun(result.sessionParams), new Date("2026-09-26T10:05:00.000Z"));
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("replays an ambiguous create with the same key inside 30 minutes", async () => {
+    clientMocks.createSwarm.mockRejectedValueOnce(apiError(503, "SERVICE_UNAVAILABLE"));
+
+    const first = await executePaperclip(swarmContext(), NOW);
+
+    expect(first).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_swarm_request_failed",
+      errorFamily: "transient_upstream",
+      sessionParams: {
+        mode: "swarm",
+        recoveryRequired: true,
+        pendingCreate: { kind: "swarm", idempotencyKey: "run-123", createdAt: "2026-09-26T10:00:00.000Z", request: expectedRosterBody },
+      },
+    });
+
+    clientMocks.createSwarm.mockResolvedValue(completed);
+    const second = await executePaperclip(nextRun(first.sessionParams), new Date("2026-09-26T10:29:59.000Z"));
+
+    expect(second).toMatchObject({ exitCode: 0, costUsd: 45, sessionParams: { swarmId: "swarm-1", recoveryRequired: false } });
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(2);
+    expect(clientMocks.createSwarm.mock.calls[1][0]).toEqual(clientMocks.createSwarm.mock.calls[0][0]);
+    expect(clientMocks.createSwarm.mock.calls[1][0].client_idempotency_key).toBe("run-123");
+  });
+
+  it("keeps the first attempt time across replays and stops after 30 minutes", async () => {
+    clientMocks.createSwarm.mockRejectedValueOnce(apiError(503, "SERVICE_UNAVAILABLE"));
+    const first = await executePaperclip(swarmContext(), NOW);
+
+    clientMocks.createSwarm.mockRejectedValueOnce(new TypeError("fetch failed"));
+    const second = await executePaperclip(nextRun(first.sessionParams), new Date("2026-09-26T10:20:00.000Z"));
+    expect(second).toMatchObject({
+      errorCode: "agrenting_swarm_request_failed",
+      sessionParams: { pendingCreate: { createdAt: "2026-09-26T10:00:00.000Z" } },
+    });
+
+    const third = await executePaperclip(nextRun(second.sessionParams), new Date("2026-09-26T10:30:01.000Z"));
+    expect(third).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_hiring_reconciliation_required",
+      errorMessage: "The team request with idempotency key run-123 was first sent more than 30 minutes ago and will not be replayed. Check your teams on Agrenting, then clear this agent's session.",
+      sessionParams: { pendingCreate: { idempotencyKey: "run-123" } },
+    });
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears the saved request when a replay is refused", async () => {
+    clientMocks.createSwarm.mockRejectedValueOnce(apiError(503, "SERVICE_UNAVAILABLE"));
+    const first = await executePaperclip(swarmContext(), NOW);
+
+    clientMocks.createSwarm.mockRejectedValueOnce(apiError(409, "AGENT_BUSY"));
+    const second = await executePaperclip(nextRun(first.sessionParams), new Date("2026-09-26T10:10:00.000Z"));
+
+    expect(second).toMatchObject({ errorCode: "agrenting_swarm_rejected" });
+    expect(second.sessionParams).toEqual({ mode: "swarm", recoveryRequired: false });
+  });
+
+  it("requires reconciliation after IDEMPOTENCY_CONFLICT and never replays", async () => {
+    clientMocks.createSwarm.mockRejectedValue(apiError(409, "IDEMPOTENCY_CONFLICT"));
+
+    const first = await executePaperclip(swarmContext(), NOW);
+
+    expect(first).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_hiring_reconciliation_required",
+      errorMessage: "Agrenting already holds a different team request under idempotency key run-123; no team was created. Check your teams on Agrenting, then clear this agent's session.",
+      sessionParams: { recoveryRequired: true, pendingCreate: { kind: "swarm", idempotencyKey: "run-123", manualOnly: true } },
+    });
+
+    const second = await executePaperclip(nextRun(first.sessionParams), new Date("2026-09-26T10:01:00.000Z"));
+    expect(second.errorCode).toBe("agrenting_hiring_reconciliation_required");
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not replay a snapshot that contained a credential", async () => {
+    clientMocks.createSwarm.mockRejectedValue(apiError(503, "SERVICE_UNAVAILABLE"));
+
+    const result = await executePaperclip(swarmContext({}, { wakeReason: "issue_assigned", taskBody: "Use ap_test here" }), NOW);
+
+    expect(result).toMatchObject({
+      errorCode: "agrenting_hiring_reconciliation_required",
+      errorFamily: null,
+      sessionParams: { pendingCreate: { manualOnly: true } },
+    });
+    expect(JSON.stringify(result.sessionParams)).not.toContain("ap_test");
+  });
+});
