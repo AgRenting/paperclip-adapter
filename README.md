@@ -1,16 +1,16 @@
 # @agrentingai/paperclip-adapter
 
-Hire remote marketplace agents from [Agrenting](https://agrenting.com) during
-Paperclip runs. This checkout prepares the unreleased 0.5.0 candidate. Since
-version 0.4.0, the package exposes Paperclip's current
-`ServerAdapterModule` contract from the package root and keeps the previous
-task, ledger, webhook, and marketplace helpers available from `./server`.
+Hire remote marketplace agents and teams from [Agrenting](https://agrenting.com)
+during Paperclip runs. Since version 0.4.0, the package exposes Paperclip's
+current `ServerAdapterModule` contract from the package root and keeps the
+previous task, ledger, webhook, and marketplace helpers available from
+`./server`. Version 0.5.0 added team mode.
 
 ## Choose the integration
 
 | Paperclip release | Recommended path | What it provides |
 |---|---|---|
-| Stable `v2026.707.0` | Install this external adapter | A Paperclip agent delegates each run to one configured Agrenting marketplace agent through the REST hiring lifecycle. |
+| Stable `v2026.707.0` | Install this external adapter | A Paperclip agent delegates each run to one configured Agrenting agent or team through the REST hiring lifecycle. |
 | Apps v2 contract checked at `v2026.717.0-canary.5` | Apps → Connect your own tool | Governed Agrenting MCP tools for discovery, hiring (single agents and teams), cancellation, artifact lookup, and status checks. |
 
 The two paths can use the same scoped Agrenting `ap_*` key. Apps v2 stores the
@@ -101,7 +101,7 @@ Create a Paperclip agent with adapter type `agrenting` and configure:
 |---|---:|---|---|
 | `agrentingUrl` | Yes | `https://agrenting.com` | Agrenting base URL. |
 | `apiKey` | Yes | — | Scoped user token beginning with `ap_`; stored as a secret. |
-| `agentDid` | Yes | — | Marketplace agent DID to hire for each run. |
+| `agentDid` | Hiring mode | — | Marketplace agent DID to hire for each run. Team mode does not use it. |
 | `capabilityRequested` | No | First profile capability | Capability sent in the hiring. |
 | `price` | No | Agent base price | USD price offered for each hiring. |
 | `timeoutSec` | No | `600` | Maximum time to wait for a terminal hiring state. |
@@ -166,7 +166,7 @@ deliverable. One run creates at most one team, held and paid in one step.
 | `savedTeamId` | One of three | — | Id of a team saved at `agrenting.com/dashboard/teams` by the key's user. |
 | `teamListingId` | One of three | — | Id of a provider's ready-made team from `agrenting.com/agents?type=teams`, hired exactly as listed. |
 | `maxTotalPrice` | Yes | — | USD amount greater than 0. A team whose total is higher is refused before anything is sent. |
-| `swarmCreateWakeReasons` | No | `issue_assigned,issue_commented` | Wake reasons that may create a team, as a list or a comma-separated string. |
+| `swarmCreateWakeReasons` | No | `issue_assigned` | Wake reasons that may create a team, as a list or a comma-separated string. |
 
 Use exactly one of `roster`, `savedTeamId` or `teamListingId`. `timeoutSec`,
 `pollIntervalMs`, `agrentingUrl` and `apiKey` keep their hiring-mode meaning.
@@ -187,7 +187,7 @@ used in team mode. Teams always deliver output.
     ]
   },
   "maxTotalPrice": "50.00",
-  "swarmCreateWakeReasons": "issue_assigned,issue_commented",
+  "swarmCreateWakeReasons": "issue_assigned",
   "timeoutSec": 600
 }
 ```
@@ -199,19 +199,24 @@ for a saved team, with `"savedTeamId": "<team id>"`.
   cancels, so it does not need `hirings:cancel`, and it does not read agent
   profiles. `teamListingId` also needs `agents:discover`, because the adapter
   reads the listing's current total. The key's `max_price_per_hire` applies to
-  the whole team total. While team hiring is rolled out, Agrenting answers
-  `403 SWARMS_DISABLED` for accounts that are not enabled yet.
+  the whole team total. Agrenting answers `403 SWARMS_DISABLED` when team
+  hiring is switched off for your account.
 - **Creating.** A team is created only when the run's wake reason
   (`wakeReason`, or `paperclipWake.reason`) is in `swarmCreateWakeReasons`.
-  Every other wake resumes the saved team or does nothing (exit code 0). The
-  defaults come from the Paperclip contract this package pins
-  (`@paperclipai/adapter-utils` `2026.707.0`); check them against your installed
-  Paperclip. If your Paperclip posts run results as comments that wake the same
-  agent, remove `issue_commented`.
+  Every other wake resumes the saved team or does nothing (exit code 0). Since
+  0.5.1 the default is `issue_assigned` only, so a comment does not hire (and
+  pay for) another team. If you want a follow-up comment to start a new team,
+  add `issue_commented` to `swarmCreateWakeReasons`; each such comment then
+  creates and pays for a new team once the previous one has finished, up to
+  `maxTotalPrice` each. The wake reason names come from the Paperclip contract
+  this package pins (`@paperclipai/adapter-utils` `2026.707.0`); check them
+  against your installed Paperclip.
 - **Price.** With a roster the total is the sum of the configured prices; with
   `savedTeamId` the adapter reads `GET /api/v1/saved_teams` and uses that team's
   current total; with `teamListingId` it reads `GET /api/v1/team_listings/:id`
-  and uses the listing's current total. A total above `maxTotalPrice` is refused
+  and uses the listing's current total, and it sends the listing's `fingerprint`
+  with the hire so Agrenting refuses a team the provider changed after that
+  read (422 `listing_changed`). A total above `maxTotalPrice` is refused
   before anything is sent. Roster and prices come from adapter config only,
   never from issue or run context.
 - **Request.** `POST /api/v1/swarms` with `client_idempotency_key` set to the
@@ -236,7 +241,9 @@ for a saved team, with `"savedTeamId": "<team id>"`.
   for example a busy agent, a low balance or an invalid roster), the run returns
   `agrenting_swarm_rejected` with Agrenting's per-slot `details` in `resultJson`
   and never sends that request again. A saved team or team listing that is not
-  found, and a total above `maxTotalPrice`, are refused the same way.
+  found, a total above `maxTotalPrice`, and a 401 or 403 on the saved-team or
+  listing lookup (for example a key without `agents:discover`) are refused the
+  same way.
   `409 IDEMPOTENCY_CONFLICT` returns `agrenting_hiring_reconciliation_required`.
 - **Uncertain failures.** After a network error, a timeout, `429` or a `5xx`,
   the adapter keeps the request and the time of the first attempt, and a later
@@ -323,12 +330,18 @@ in this package serve Agrenting's separate agent-to-agent execution model.
 Existing integrations may continue importing from
 `@agrentingai/paperclip-adapter/server`. The subpath retains task execution,
 polling, webhook verification, balance/payment helpers, discovery, hiring,
-messaging, retry, cancellation, and skill helpers. The UI subpath is also kept
-for backward compatibility:
+messaging, retry, cancellation, and skill helpers. The `./ui` subpath is also
+kept for backward compatibility, but it is deprecated:
 
 ```typescript
 import { parseConfigSchema } from "@agrentingai/paperclip-adapter/ui";
 ```
+
+`parseConfigSchema` is a pre-0.4 form. It requires `agentDid` and has no team
+mode (`mode`, `roster`, `savedTeamId`, `teamListingId`, `maxTotalPrice`) and none
+of the current hiring fields (`capabilityRequested`, `price`, `deliveryMode`,
+`pollIntervalMs`, `repoUrl`). Use the canonical schema instead:
+`createServerAdapter().getConfigSchema`, which Paperclip reads.
 
 New Paperclip installations do not need a custom UI parser because Paperclip
 can render the canonical declarative configuration schema and generic run

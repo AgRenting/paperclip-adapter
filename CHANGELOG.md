@@ -1,23 +1,71 @@
 # Changelog
 
-## 0.5.0 (unreleased)
+## 0.5.1 (2026-09-29)
+
+### Changed default: a comment no longer starts a paid team
+
+- **Default `swarmCreateWakeReasons` is now `issue_assigned` (was
+  `issue_assigned,issue_commented`).** Before, if Paperclip posted a run's result
+  as a comment that woke the same agent, that comment hired and paid for a new
+  team each time, limited only by `maxTotalPrice` and the budget gate. Now only
+  an assigned issue creates a team, and a comment wake resumes a saved team or
+  does nothing. Operators who want a follow-up comment to start a team must
+  opt in: set `swarmCreateWakeReasons` to `issue_assigned,issue_commented`.
+  An agent whose saved config already holds `swarmCreateWakeReasons` keeps that
+  value, including one the form pre-filled from the old default, so check
+  existing team agents.
+
+### Team mode
+
+- Send the listed team's `fingerprint` as `team_listing_fingerprint` when hiring
+  a `teamListingId`, so Agrenting refuses a team the provider changed after the
+  adapter read it (422 `listing_changed`), even at the same total. An uncertain
+  create is replayed with the same fingerprint. Older Agrenting servers that
+  return none are hired as before.
+- Answer a 401, 403 or other final refusal of the saved-team or listing lookup,
+  such as a key without `agents:discover`, with `agrenting_swarm_rejected`
+  and the HTTP status and code, instead of a generic request failure. Nothing is
+  charged.
+- Write every team refusal to the run log (stderr), as single-hire mode does.
+- Refuse a replay snapshot that carries a blank or stray second team source
+  (`team_listing_id` beside a roster or saved team, or a lead beside
+  `saved_team_id`).
+
+### Docs and tests
+
+- Mark the legacy `./ui` `parseConfigSchema` helper `@deprecated`. It is a
+  pre-0.4 form that requires `agentDid` and has no team or current hiring
+  fields; use `createServerAdapter().getConfigSchema`.
+- README: `agentDid` is required in hiring mode only, teams are named in the
+  integration table, and the team-hiring rollout wording is gone. The
+  changelog no longer marks published releases as unreleased.
+- Correct the `roster` / `savedTeamId` / `teamListingId` doc comment in the
+  published types.
+- Test the config-schema team fields, the `agrenting_swarm_config_invalid`
+  environment check and the release files.
+- Stop tracking `.npmrc`: it held only an `${NPM_TOKEN}` placeholder, CI never
+  publishes, and it overrode the user-level npm login, so a local publish failed
+  with E404. Publish with your own npm login.
+
+## 0.5.0 (2026-09-28)
 
 - Add team mode (`mode: "swarm"`): each allowed run hires one Agrenting team
   (a lead and 1-8 members) from a configured `roster`, a saved team
   (`savedTeamId`) or a provider's ready-made team (`teamListingId`) through
   `POST /api/v1/swarms`, capped by the required `maxTotalPrice`.
 - Create teams only on wake reasons in `swarmCreateWakeReasons` (default
-  `issue_assigned,issue_commented`); other wakes resume a saved team or do
-  nothing.
+  `issue_assigned,issue_commented` in 0.5.0; `issue_assigned` since 0.5.1);
+  other wakes resume a saved team or do nothing.
 - Detach on timeout without cancelling; the next run resumes the saved
   `swarmId`. Report `costUsd` as the team's charged amount and return the
   lead's deliverable, member summaries and open questions.
-- Treat 4xx team refusals as final (`agrenting_swarm_rejected` with per-slot
-  details) and replay uncertain failures with the same key only within 30
-  minutes of the first attempt.
+- Treat 4xx team refusals other than 408, 425 and 429 as final
+  (`agrenting_swarm_rejected` with per-slot details) and replay uncertain
+  failures (network errors, 408, 425, 429 and 5xx) with the same key only within
+  30 minutes of the first attempt.
 - Keep truncated task descriptions within Agrenting's 5,000-character limit.
 
-## 0.4.1 (unreleased)
+### Also in 0.5.0 (drafted as 0.4.1, never published on its own)
 
 - Recover accepted hirings and ambiguous creation responses across Paperclip runs
   using the original hiring ID or exact request/idempotency key. Bind recovery to
