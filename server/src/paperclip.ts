@@ -40,7 +40,7 @@ export const agentConfigurationDoc = `# agrenting agent configuration
 Adapter: agrenting
 
 Use when:
-- A Paperclip agent should delegate each heartbeat to a remote agent hired from Agrenting.
+- A Paperclip agent should delegate each heartbeat to a remote agent or team hired from Agrenting.
 - The operator has an Agrenting user API token and sufficient ledger balance.
 
 Core fields:
@@ -76,7 +76,7 @@ Team mode (mode: "swarm"):
 - Use exactly one of roster, savedTeamId or teamListingId.
 - maxTotalPrice (required): the adapter refuses a team whose total is higher
 - swarmCreateWakeReasons: comma-separated wake reasons that may create a team;
-  default issue_assigned,issue_commented; other wakes only resume a saved team
+  default issue_assigned; other wakes only resume a saved team
 - On timeout the adapter detaches without cancelling; the next run resumes the team.
 - Scopes: hire:create and hirings:read; teamListingId also needs agents:discover.
 `;
@@ -594,7 +594,7 @@ export async function executePaperclip(ctx: AdapterExecutionContext, now: Date =
 
 // ── Team (swarm) mode ─────────────────────────────────────────────
 
-export const DEFAULT_SWARM_CREATE_WAKE_REASONS: readonly string[] = ["issue_assigned", "issue_commented"];
+export const DEFAULT_SWARM_CREATE_WAKE_REASONS: readonly string[] = ["issue_assigned"];
 const MAX_SWARM_MEMBERS = 8;
 const MAX_SWARM_NOTE_LENGTH = 500;
 
@@ -761,10 +761,12 @@ export function swarmRequestFromRecovery(pending: Record<string, unknown>): Swar
   const hasSavedTeam = nonEmpty(request.saved_team_id) !== null;
   const hasTeamListing = nonEmpty(request.team_listing_id) !== null;
   if ([hasRoster, hasSavedTeam, hasTeamListing].filter(Boolean).length !== 1) return null;
-  if (hasTeamListing && ["lead", "members", "saved_team_id"].some((field) => field in request)) return null;
+  if ("team_listing_id" in request && ["lead", "members", "saved_team_id"].some((field) => field in request)) return null;
+  if ("saved_team_id" in request && ["lead", "members"].some((field) => field in request)) return null;
+  if ("team_listing_fingerprint" in request && !(hasTeamListing && nonEmpty(request.team_listing_fingerprint))) return null;
   const allowed = new Set([
     "task_description", "task_input", "delivery_mode", "client_idempotency_key",
-    "total_price", "lead", "members", "saved_team_id", "team_listing_id",
+    "total_price", "lead", "members", "saved_team_id", "team_listing_id", "team_listing_fingerprint",
   ]);
   if (Object.keys(request).some((field) => !allowed.has(field))) return null;
   return request as unknown as SwarmCreateBody;
@@ -1066,6 +1068,19 @@ async function safeLog(
   }
 }
 
+/** A 401, 403 or other final refusal of a team lookup, named like a refused create. Null when the failure is not final. */
+function swarmLookupRefused(what: string, error: unknown): AdapterExecutionResult | null {
+  const failure = classifySwarmCreateError(error);
+  if (failure.kind !== "definitive") return null;
+  const label = failure.code ? `HTTP ${failure.httpStatus} ${failure.code}` : `HTTP ${failure.httpStatus}`;
+  return swarmRejected(`Agrenting refused the ${what} lookup (${label}): ${failure.message}`, {
+    httpStatus: failure.httpStatus,
+    code: failure.code,
+    message: failure.message,
+    details: failure.details,
+  });
+}
+
 /** Replay, resume, wake gate, budget and create, in that order (15.2, 15.4, 15.5). */
 export async function startSwarm(run: SwarmRun): Promise<SwarmStatus | AdapterExecutionResult> {
   const { ctx, client, config, swarm, state, prior, now } = run;
@@ -1127,7 +1142,11 @@ export async function startSwarm(run: SwarmRun): Promise<SwarmStatus | AdapterEx
       listing = await client.getTeamListing(listingId);
     } catch (error) {
       const facts = asRecord(error);
-      if (facts?.status !== 404) throw error;
+      if (facts?.status !== 404) {
+        const refused = swarmLookupRefused("team listing", error);
+        if (refused) return refused;
+        throw error;
+      }
       const message = `Team listing ${listingId} was not found for this API key.`;
       return swarmRejected(message, {
         httpStatus: 404, code: typeof facts.code === "string" ? facts.code : null, message,
@@ -1137,11 +1156,25 @@ export async function startSwarm(run: SwarmRun): Promise<SwarmStatus | AdapterEx
     const cents = priceToCents(listing.total_price);
     if (cents === null) throw new Error(`Agrenting returned team listing ${listing.id} without a readable total_price.`);
     totalCents = cents;
-    body = { ...base, total_price: centsToPrice(cents), team_listing_id: listing.id };
+    const fingerprint = nonEmpty(listing.fingerprint);
+    body = {
+      ...base,
+      total_price: centsToPrice(cents),
+      team_listing_id: listing.id,
+      ...(fingerprint ? { team_listing_fingerprint: fingerprint } : {}),
+    };
     description = `listed team ${listing.name} (${listing.id})`;
   } else {
     const teamId = swarm.savedTeamId ?? "";
-    const team = (await client.listSavedTeams()).find((entry: SavedTeam) => entry.id === teamId);
+    let teams: SavedTeam[];
+    try {
+      teams = await client.listSavedTeams();
+    } catch (error) {
+      const refused = swarmLookupRefused("saved team", error);
+      if (refused) return refused;
+      throw error;
+    }
+    const team = teams.find((entry: SavedTeam) => entry.id === teamId);
     if (!team) {
       const message = `Saved team ${teamId} was not found for this API key; no team was created.`;
       return swarmRejected(message, {
@@ -1234,7 +1267,10 @@ export async function executePaperclipSwarm(
         "Restore the original Agrenting URL and credential to reconcile the saved team before creating another.");
     }
     const started = await startSwarm({ ctx, client, config, swarm: parsed.value, state, prior, now });
-    if (isAdapterResult(started)) return started;
+    if (isAdapterResult(started)) {
+      if (started.exitCode === 1 && started.errorMessage) await safeLog(ctx, "stderr", `[agrenting] ${started.errorMessage}\n`);
+      return started;
+    }
     status = started;
 
     const recordQuestions = async (snapshot: SwarmStatus): Promise<void> => {
@@ -1555,7 +1591,7 @@ export function getPaperclipConfigSchema(): AdapterConfigSchema {
         key: "swarmCreateWakeReasons",
         label: "Team create wake reasons",
         type: "text",
-        default: "issue_assigned,issue_commented",
+        default: DEFAULT_SWARM_CREATE_WAKE_REASONS.join(","),
         hint: "Team mode. Comma-separated Paperclip wake reasons that may create a paid team. Other wakes only resume a saved team.",
       },
     ],

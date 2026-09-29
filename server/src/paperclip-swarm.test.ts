@@ -134,7 +134,7 @@ describe("team config", () => {
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     expect(parsed.value.maxTotalPriceCents).toBe(5000);
-    expect(parsed.value.swarmCreateWakeReasons).toEqual(["issue_assigned", "issue_commented"]);
+    expect(parsed.value.swarmCreateWakeReasons).toEqual(["issue_assigned"]);
     expect(parsed.value.roster?.members[1].price).toBe("10.00");
     expect(swarmConfigFrom({ roster: JSON.stringify(roster), maxTotalPrice: "50.00" })).toEqual(parsed);
   });
@@ -241,6 +241,44 @@ describe("team snapshot replay", () => {
         },
       })
     ).toBeNull();
+  });
+
+  it("replays a listed team with the fingerprint it was reviewed under", () => {
+    const listed = {
+      task_description: "Harden auth",
+      delivery_mode: "output",
+      client_idempotency_key: "run-123",
+      total_price: "45.00",
+      team_listing_id: "listing-1",
+      team_listing_fingerprint: "f".repeat(64),
+    };
+    expect(swarmRequestFromRecovery({ ...snapshot, request: listed })).toEqual(listed);
+  });
+
+  it("refuses a fingerprint that is blank, not text, or beside another team source", () => {
+    const listed = {
+      task_description: "Harden auth",
+      delivery_mode: "output",
+      client_idempotency_key: "run-123",
+      total_price: "45.00",
+      team_listing_id: "listing-1",
+    };
+    for (const fingerprint of ["", "  ", 7, null]) {
+      expect(swarmRequestFromRecovery({ ...snapshot, request: { ...listed, team_listing_fingerprint: fingerprint } })).toBeNull();
+    }
+    expect(swarmRequestFromRecovery({ ...snapshot, request: { ...request, team_listing_fingerprint: "abc" } })).toBeNull();
+  });
+
+  it("refuses a second team source key even when its value is blank", () => {
+    const lead = { agent_did: "did:agrenting:lead", capability_requested: "planning", price: "20.00" };
+    const member = { agent_did: "did:agrenting:m", capability_requested: "testing", price: "25.00" };
+    const rosterRequest: Record<string, unknown> = { ...request, lead, members: [member] };
+    delete rosterRequest.saved_team_id;
+    expect(swarmRequestFromRecovery({ ...snapshot, request: rosterRequest })).toEqual(rosterRequest);
+    expect(swarmRequestFromRecovery({ ...snapshot, request: { ...rosterRequest, team_listing_id: "" } })).toBeNull();
+    expect(swarmRequestFromRecovery({ ...snapshot, request: { ...request, lead } })).toBeNull();
+    expect(swarmRequestFromRecovery({ ...snapshot, request: { ...request, members: [member] } })).toBeNull();
+    expect(swarmRequestFromRecovery({ ...snapshot, request: { ...request, team_listing_id: "" } })).toBeNull();
   });
 });
 
@@ -416,6 +454,68 @@ describe("saved and listed teams", () => {
     expect(clientMocks.listSavedTeams).not.toHaveBeenCalled();
   });
 
+  it("sends the listing's fingerprint so a changed team is refused at the same total", async () => {
+    const fingerprint = "a".repeat(64);
+    clientMocks.getTeamListing.mockResolvedValue({ ...teamListing, fingerprint });
+    clientMocks.createSwarm.mockResolvedValue(completed);
+
+    await executePaperclip(swarmContext(listedConfig), NOW);
+
+    expect(clientMocks.createSwarm).toHaveBeenCalledWith({
+      task_description: "Harden auth\n\nReview and test the auth module.",
+      task_input: taskInput,
+      delivery_mode: "output",
+      client_idempotency_key: "run-123",
+      total_price: "45.00",
+      team_listing_id: "listing-1",
+      team_listing_fingerprint: fingerprint,
+    });
+  });
+
+  it.each([undefined, "", "  "])("sends no fingerprint when the listing carries %j", async (fingerprint) => {
+    clientMocks.getTeamListing.mockResolvedValue({ ...teamListing, fingerprint });
+    clientMocks.createSwarm.mockResolvedValue(completed);
+
+    await executePaperclip(swarmContext(listedConfig), NOW);
+
+    expect(clientMocks.createSwarm.mock.calls[0][0]).not.toHaveProperty("team_listing_fingerprint");
+  });
+
+  it("replays an uncertain listed-team create with the same fingerprint", async () => {
+    const fingerprint = "b".repeat(64);
+    clientMocks.getTeamListing.mockResolvedValue({ ...teamListing, fingerprint });
+    clientMocks.createSwarm.mockRejectedValueOnce(apiError(503, "SERVICE_UNAVAILABLE"));
+
+    const first = await executePaperclip(swarmContext(listedConfig), NOW);
+    expect(first).toMatchObject({
+      errorCode: "agrenting_swarm_request_failed",
+      sessionParams: { pendingCreate: { request: { team_listing_fingerprint: fingerprint } } },
+    });
+
+    clientMocks.createSwarm.mockResolvedValue(completed);
+    const second = await executePaperclip(nextRun(first.sessionParams, undefined, listedConfig), new Date("2026-09-26T10:05:00.000Z"));
+
+    expect(second).toMatchObject({ exitCode: 0, sessionParams: { swarmId: "swarm-1" } });
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(2);
+    expect(clientMocks.createSwarm.mock.calls[1][0]).toEqual(clientMocks.createSwarm.mock.calls[0][0]);
+    expect(clientMocks.createSwarm.mock.calls[1][0].team_listing_fingerprint).toBe(fingerprint);
+    expect(clientMocks.getTeamListing).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a team the provider changed after the fingerprint was read", async () => {
+    clientMocks.getTeamListing.mockResolvedValue({ ...teamListing, fingerprint: "c".repeat(64) });
+    clientMocks.createSwarm.mockRejectedValue(apiError(422, "VALIDATION_ERROR", [{ slot: "team_listing_fingerprint", code: "listing_changed" }]));
+
+    const result = await executePaperclip(swarmContext(listedConfig), NOW);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_swarm_rejected",
+      resultJson: { httpStatus: 422, details: [{ slot: "team_listing_fingerprint", code: "listing_changed" }] },
+    });
+    expect(result.sessionParams).toEqual({ mode: "swarm", recoveryRequired: false });
+  });
+
   it("refuses a listed team above maxTotalPrice", async () => {
     clientMocks.getTeamListing.mockResolvedValue({ ...teamListing, total_price: "55.00" });
 
@@ -440,6 +540,48 @@ describe("saved and listed teams", () => {
       sessionParams: { mode: "swarm", recoveryRequired: false },
       resultJson: { rejected: true, details: [{ slot: "team_listing_id", code: "not_found" }] },
     });
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
+  });
+
+  it.each([401, 403])("names an HTTP %i refusal of the listing lookup instead of a generic failure", async (status) => {
+    clientMocks.getTeamListing.mockRejectedValue(apiError(status, "FORBIDDEN"));
+
+    const result = await executePaperclip(swarmContext(listedConfig), NOW);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_swarm_rejected",
+      errorMessage: `Agrenting refused the team listing lookup (HTTP ${status} FORBIDDEN): FORBIDDEN message`,
+      sessionParams: { mode: "swarm", recoveryRequired: false },
+      resultJson: { rejected: true, httpStatus: status, code: "FORBIDDEN", message: "FORBIDDEN message", details: [] },
+    });
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
+  });
+
+  it("names an HTTP 403 refusal of the saved-team lookup instead of a generic failure", async () => {
+    clientMocks.listSavedTeams.mockRejectedValue(apiError(403, "FORBIDDEN"));
+
+    const result = await executePaperclip(swarmContext(savedConfig), NOW);
+
+    expect(result).toMatchObject({
+      exitCode: 1,
+      errorCode: "agrenting_swarm_rejected",
+      errorMessage: "Agrenting refused the saved team lookup (HTTP 403 FORBIDDEN): FORBIDDEN message",
+      sessionParams: { mode: "swarm", recoveryRequired: false },
+      resultJson: { rejected: true, httpStatus: 403 },
+    });
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
+  });
+
+  it("keeps an uncertain lookup failure retryable", async () => {
+    clientMocks.getTeamListing.mockRejectedValue(apiError(503, "SERVICE_UNAVAILABLE"));
+
+    const listed = await executePaperclip(swarmContext(listedConfig), NOW);
+    expect(listed).toMatchObject({ errorCode: "agrenting_swarm_request_failed", errorFamily: "transient_upstream" });
+
+    clientMocks.listSavedTeams.mockRejectedValue(new TypeError("fetch failed"));
+    const saved = await executePaperclip(swarmContext(savedConfig), NOW);
+    expect(saved).toMatchObject({ errorCode: "agrenting_swarm_request_failed", errorFamily: "transient_upstream" });
     expect(clientMocks.createSwarm).not.toHaveBeenCalled();
   });
 });
@@ -467,9 +609,39 @@ describe("team wake gating", () => {
   it("reads the wake reason from paperclipWake", async () => {
     clientMocks.createSwarm.mockResolvedValue(completed);
 
-    await executePaperclip(swarmContext({}, { paperclipWake: { reason: "issue_commented" }, taskTitle: "Harden auth" }), NOW);
+    await executePaperclip(swarmContext({}, { paperclipWake: { reason: "issue_assigned" }, taskTitle: "Harden auth" }), NOW);
 
     expect(clientMocks.createSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not hire a new team on a comment unless the operator opts in", async () => {
+    const comment = { wakeReason: "issue_commented", taskTitle: "Harden auth" };
+
+    const declined = await executePaperclip(swarmContext({}, comment), NOW);
+
+    expect(declined).toMatchObject({
+      exitCode: 0,
+      summary: "No Agrenting team was created: wake reason issue_commented is not in swarmCreateWakeReasons.",
+      resultJson: { swarmCreated: false, wakeReason: "issue_commented" },
+    });
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
+
+    clientMocks.createSwarm.mockResolvedValue(completed);
+    await executePaperclip(swarmContext({ swarmCreateWakeReasons: "issue_assigned,issue_commented" }, comment), NOW);
+    expect(clientMocks.createSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("still resumes a saved team on a comment wake", async () => {
+    clientMocks.getSwarm.mockResolvedValue(completed);
+
+    const result = await executePaperclip(
+      nextRun({ mode: "swarm", swarmId: "swarm-1", recoveryRequired: true }, { wakeReason: "issue_commented" }),
+      NOW
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(clientMocks.getSwarm).toHaveBeenCalledWith("swarm-1");
+    expect(clientMocks.createSwarm).not.toHaveBeenCalled();
   });
 
   it("uses the configured wake reasons", async () => {
@@ -550,6 +722,61 @@ describe("team create failures", () => {
 
     await executePaperclip(nextRun(result.sessionParams), new Date("2026-09-26T10:05:00.000Z"));
     expect(clientMocks.createSwarm).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes a team refusal to the run log, as single-hire mode does", async () => {
+    clientMocks.createSwarm.mockRejectedValue(apiError(409, "AGENT_BUSY"));
+    const ctx = swarmContext();
+
+    await executePaperclip(ctx, NOW);
+
+    expect(ctx.onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[agrenting] Agrenting refused the team (HTTP 409 AGENT_BUSY): AGENT_BUSY message\n"
+    );
+  });
+
+  it("writes budget, missing-team and lookup refusals to the run log", async () => {
+    const over = swarmContext({ maxTotalPrice: "40.00" });
+    await executePaperclip(over, NOW);
+    expect(over.onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[agrenting] Team total 45.00 exceeds maxTotalPrice 40.00; no team was created.\n"
+    );
+
+    clientMocks.listSavedTeams.mockResolvedValue([]);
+    const missing = swarmContext({ roster: undefined, savedTeamId: "team-1" });
+    await executePaperclip(missing, NOW);
+    expect(missing.onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[agrenting] Saved team team-1 was not found for this API key; no team was created.\n"
+    );
+
+    clientMocks.getTeamListing.mockRejectedValue(apiError(403, "FORBIDDEN"));
+    const forbidden = swarmContext({ roster: undefined, teamListingId: "listing-1" });
+    await executePaperclip(forbidden, NOW);
+    expect(forbidden.onLog).toHaveBeenCalledWith(
+      "stderr",
+      "[agrenting] Agrenting refused the team listing lookup (HTTP 403 FORBIDDEN): FORBIDDEN message\n"
+    );
+  });
+
+  it("logs a refusal once and still returns it when the log sink is down", async () => {
+    const ctx = swarmContext({ maxTotalPrice: "40.00" });
+    vi.mocked(ctx.onLog).mockRejectedValue(new Error("log sink down"));
+
+    const result = await executePaperclip(ctx, NOW);
+
+    expect(result).toMatchObject({ errorCode: "agrenting_swarm_rejected" });
+    expect(vi.mocked(ctx.onLog).mock.calls.filter(([stream]) => stream === "stderr")).toHaveLength(1);
+  });
+
+  it("does not log a stderr line for a run that creates nothing on purpose", async () => {
+    const ctx = swarmContext({}, { wakeReason: "heartbeat_timer", taskTitle: "Harden auth" });
+
+    await executePaperclip(ctx, NOW);
+
+    expect(vi.mocked(ctx.onLog).mock.calls.filter(([stream]) => stream === "stderr")).toHaveLength(0);
   });
 
   it("replays an ambiguous create with the same key inside 30 minutes", async () => {
@@ -808,6 +1035,31 @@ describe("team environment test", () => {
     expect(result.status).toBe("pass");
     expect(result.checks.map((check) => check.code)).toEqual(["agrenting_connection_ok", "agrenting_swarm_roster_ok"]);
     expect(clientMocks.getAgentProfile).not.toHaveBeenCalled();
+  });
+
+  it("fails team mode with no team source before any connection check", async () => {
+    const result = await testPaperclipEnvironment(env({ ...base, roster: undefined }));
+
+    expect(result.status).toBe("fail");
+    expect(result.checks).toEqual([
+      {
+        code: "agrenting_swarm_config_invalid",
+        level: "error",
+        message: "Swarm mode requires exactly one of roster, savedTeamId or teamListingId.",
+      },
+    ]);
+    expect(clientMocks.listHirings).not.toHaveBeenCalled();
+  });
+
+  it("fails team mode with two team sources or no maxTotalPrice", async () => {
+    const two = await testPaperclipEnvironment(env({ ...base, savedTeamId: "team-1" }));
+    expect(two.status).toBe("fail");
+    expect(two.checks.map((check) => check.code)).toEqual(["agrenting_swarm_config_invalid"]);
+
+    const noBudget = await testPaperclipEnvironment(env({ ...base, maxTotalPrice: undefined }));
+    expect(noBudget.status).toBe("fail");
+    expect(noBudget.checks.map((check) => check.code)).toEqual(["agrenting_swarm_config_invalid"]);
+    expect(clientMocks.listHirings).not.toHaveBeenCalled();
   });
 
   it("fails a saved team that is not found", async () => {

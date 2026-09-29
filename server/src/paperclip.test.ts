@@ -4,6 +4,8 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  DEFAULT_SWARM_CREATE_WAKE_REASONS,
+  agentConfigurationDoc,
   createCanonicalServerAdapter,
   executePaperclip,
   getPaperclipConfigSchema,
@@ -674,6 +676,35 @@ describe("canonical environment and configuration", () => {
     expect(fields.pollIntervalMs).toBeDefined();
     expect(fields.repoUrl).toBeDefined();
     expect(fields.deliveryMode.default).toBe("output");
+  });
+
+  it("publishes the team-mode fields and leaves agentDid optional", () => {
+    const schema = getPaperclipConfigSchema();
+    const fields = Object.fromEntries(
+      schema.fields.map((field) => [field.key, field])
+    );
+
+    expect(fields.mode.default).toBe("hiring");
+    expect(fields.mode.options?.map((option) => option.value)).toEqual(["hiring", "swarm"]);
+    for (const key of ["roster", "savedTeamId", "teamListingId", "maxTotalPrice", "swarmCreateWakeReasons"]) {
+      expect(fields[key], key).toBeDefined();
+    }
+    expect(fields.agentDid.required).toBeUndefined();
+    expect(fields.teamListingId.hint).toBe(
+      "Team mode. The id of a ready-made team from agrenting.com/agents?type=teams. Use exactly one of roster, savedTeamId or teamListingId."
+    );
+  });
+
+  it("defaults team creation to an assigned issue only, in the form and in the parser", () => {
+    const fields = Object.fromEntries(
+      getPaperclipConfigSchema().fields.map((field) => [field.key, field])
+    );
+
+    expect(fields.swarmCreateWakeReasons.default).toBe("issue_assigned");
+    expect(fields.swarmCreateWakeReasons.default).toBe(DEFAULT_SWARM_CREATE_WAKE_REASONS.join(","));
+    expect(DEFAULT_SWARM_CREATE_WAKE_REASONS).toEqual(["issue_assigned"]);
+    expect(agentConfigurationDoc).toContain("default issue_assigned;");
+    expect(agentConfigurationDoc).not.toContain("issue_commented");
   });
 
   it("round-trips hiring session state", () => {

@@ -31,9 +31,9 @@ export interface AgrentingAdapterConfig {
   instructionsBundleMode?: "managed" | "inline";
   /** "swarm" hires one Agrenting team per allowed run; any other value hires `agentDid`. */
   mode?: "hiring" | "swarm";
-  /** Team mode roster, as an object or a JSON string. Use either roster or savedTeamId. */
+  /** Team mode roster, as an object or a JSON string. Use exactly one of roster, savedTeamId or teamListingId. */
   roster?: SwarmRoster | string;
-  /** Team mode: id of a team saved at agrenting.com/dashboard/teams. */
+  /** Team mode: id of a team saved at agrenting.com/dashboard/teams. Use exactly one of roster, savedTeamId or teamListingId. */
   savedTeamId?: string;
   /** A listed team's id from GET /api/v1/team_listings. Use exactly one of roster, savedTeamId or teamListingId. */
   teamListingId?: string;
@@ -402,6 +402,8 @@ export interface SwarmCreateBody {
   members?: SwarmMemberBody[];
   saved_team_id?: string;
   team_listing_id?: string;
+  /** The listing's fingerprint as read just before the hire; Agrenting refuses a changed team with 422 listing_changed. */
+  team_listing_fingerprint?: string;
 }
 
 export type SwarmStatusValue =
@@ -496,6 +498,8 @@ export interface TeamListing {
   total_price: string;
   agent_count: number;
   available: boolean;
+  /** Digest of the team's agents, capabilities and shares; absent from older Agrenting servers. */
+  fingerprint?: string;
 }
 
 /** Why a team create was refused; returned in resultJson. */
