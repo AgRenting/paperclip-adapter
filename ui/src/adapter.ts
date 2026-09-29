@@ -30,6 +30,12 @@ export interface UIAdapterInfo {
 /**
  * Parse the adapter config schema into UI-renderable config fields.
  * This is called by the Paperclip UI to generate the configuration form.
+ *
+ * @deprecated Legacy pre-0.4 form: it requires `agentDid` and has no team-mode
+ * or current hiring fields (`mode`, `roster`, `savedTeamId`, `teamListingId`,
+ * `maxTotalPrice`, `capabilityRequested`, `price`, `deliveryMode`,
+ * `pollIntervalMs`, `repoUrl`). Use `createServerAdapter().getConfigSchema`
+ * (`getPaperclipConfigSchema`), the canonical schema Paperclip reads.
  */
 export function parseConfigSchema(): UIAdapterInfo {
   return {
